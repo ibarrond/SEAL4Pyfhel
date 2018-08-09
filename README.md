@@ -7,7 +7,7 @@ Most notable changes are:
 - Precoded config.h
 - Makefile to automatize update of this repo with newer SEAL releases.
 
-This reposiroty DOES NOT belong to me. It is propperty of Microsoft. I just redistribute it with the exact same legal framework. For further legal considerations, please read the LICENSE.
+This reposiroty DOES NOT belong to me. It is property of Microsoft. I just redistribute it with the exact same legal framework. For further legal considerations, please read the LICENSE.
 
 ------------------
 
