@@ -19,9 +19,9 @@ download:
 
 fix_original:
 	# Run cmake .
-	# cd ${SRC_DIR}/SEAL-master/ && cmake . && cd -
+	cd ${SRC_DIR}/SEAL-master/ && cmake . && cd -
 	# # Moving license
-	# mv ${SRC_DIR}/SEAL-master/LICENSE LICENSE
+	mv ${SRC_DIR}/SEAL-master/LICENSE LICENSE
 	# Removing unnecesary files (all outside of native)
 	find ${SRC_DIR}/SEAL-master/ -mindepth 1 -maxdepth 1 ! -wholename '*native*' -exec rm -rf {} \;
 	# Moving the important .cpp and .h files
