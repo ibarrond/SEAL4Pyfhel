@@ -19,7 +19,7 @@
 
 #include "gsl_assert.h" // for Ensures, Expects
 #include "gsl_util.h"   // for narrow_cast
-#include "span_ext.h"       // for operator!=, operator==, dynamic_extent
+#include "gsl_span_ext.h"       // for operator!=, operator==, dynamic_extent
 
 #include <algorithm> // for equal, lexicographical_compare
 #include <array>     // for array

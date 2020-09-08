@@ -29,7 +29,7 @@
 
 
 #include "gsl_util.h" // for narrow_cast, narrow
-#include "span.h"     // for span
+#include "gsl_span.h"     // for span
 
 #include <algorithm> // for lexicographical_compare
 #include <cstddef>   // for ptrdiff_t, size_t
