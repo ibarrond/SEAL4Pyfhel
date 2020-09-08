@@ -1,14 +1,14 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/evaluator.h"
-#include "seal/util/common.h"
-#include "seal/util/galois.h"
-#include "seal/util/numth.h"
-#include "seal/util/polyarithsmallmod.h"
-#include "seal/util/polycore.h"
-#include "seal/util/scalingvariant.h"
-#include "seal/util/uintarith.h"
+#include "evaluator.h"
+#include "common.h"
+#include "galois.h"
+#include "numth.h"
+#include "polyarithsmallmod.h"
+#include "polycore.h"
+#include "scalingvariant.h"
+#include "uintarith.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>

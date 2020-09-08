@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include "seal/intarray.h"
-#include "seal/memorymanager.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
+#include "intarray.h"
+#include "memorymanager.h"
+#include "common.h"
+#include "defines.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>

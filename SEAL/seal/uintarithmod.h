@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include "seal/util/pointer.h"
-#include "seal/util/uintarith.h"
-#include "seal/util/uintcore.h"
+#include "pointer.h"
+#include "uintarith.h"
+#include "uintcore.h"
 #include <cstdint>
 
 namespace seal

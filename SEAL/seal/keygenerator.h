@@ -3,17 +3,17 @@
 
 #pragma once
 
-#include "seal/context.h"
-#include "seal/galoiskeys.h"
-#include "seal/memorymanager.h"
-#include "seal/publickey.h"
-#include "seal/randomgen.h"
-#include "seal/relinkeys.h"
-#include "seal/secretkey.h"
-#include "seal/serializable.h"
-#include "seal/util/defines.h"
-#include "seal/util/iterator.h"
-#include "seal/util/ntt.h"
+#include "context.h"
+#include "galoiskeys.h"
+#include "memorymanager.h"
+#include "publickey.h"
+#include "randomgen.h"
+#include "relinkeys.h"
+#include "secretkey.h"
+#include "serializable.h"
+#include "defines.h"
+#include "iterator.h"
+#include "ntt.h"
 #include <memory>
 #include <random>
 

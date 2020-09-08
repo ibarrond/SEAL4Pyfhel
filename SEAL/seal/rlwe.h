@@ -3,12 +3,12 @@
 
 #pragma once
 
-#include "seal/ciphertext.h"
-#include "seal/context.h"
-#include "seal/encryptionparams.h"
-#include "seal/publickey.h"
-#include "seal/randomgen.h"
-#include "seal/secretkey.h"
+#include "ciphertext.h"
+#include "context.h"
+#include "encryptionparams.h"
+#include "publickey.h"
+#include "randomgen.h"
+#include "secretkey.h"
 #include <cstdint>
 
 namespace seal

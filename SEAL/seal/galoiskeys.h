@@ -3,13 +3,13 @@
 
 #pragma once
 
-#include "seal/ciphertext.h"
-#include "seal/encryptionparams.h"
-#include "seal/kswitchkeys.h"
-#include "seal/memorymanager.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/galois.h"
+#include "ciphertext.h"
+#include "encryptionparams.h"
+#include "kswitchkeys.h"
+#include "memorymanager.h"
+#include "common.h"
+#include "defines.h"
+#include "galois.h"
 #include <iostream>
 #include <numeric>
 #include <vector>

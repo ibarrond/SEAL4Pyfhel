@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include "seal/intarray.h"
-#include "seal/memorymanager.h"
-#include "seal/util/defines.h"
+#include "intarray.h"
+#include "memorymanager.h"
+#include "defines.h"
 #include <ios>
 #include <iostream>
 

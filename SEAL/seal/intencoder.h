@@ -3,11 +3,11 @@
 
 #pragma once
 
-#include "seal/biguint.h"
-#include "seal/context.h"
-#include "seal/memorymanager.h"
-#include "seal/modulus.h"
-#include "seal/plaintext.h"
+#include "biguint.h"
+#include "context.h"
+#include "memorymanager.h"
+#include "modulus.h"
+#include "plaintext.h"
 #include <cstdint>
 
 namespace seal

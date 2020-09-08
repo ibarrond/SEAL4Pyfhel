@@ -3,14 +3,14 @@
 
 #pragma once
 
-#include "seal/encryptionparams.h"
-#include "seal/memorymanager.h"
-#include "seal/modulus.h"
-#include "seal/util/galois.h"
-#include "seal/util/ntt.h"
-#include "seal/util/numth.h"
-#include "seal/util/pointer.h"
-#include "seal/util/rns.h"
+#include "encryptionparams.h"
+#include "memorymanager.h"
+#include "modulus.h"
+#include "galois.h"
+#include "ntt.h"
+#include "numth.h"
+#include "pointer.h"
+#include "rns.h"
 #include <functional>
 #include <memory>
 #include <unordered_map>

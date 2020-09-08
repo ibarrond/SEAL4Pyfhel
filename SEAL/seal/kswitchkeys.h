@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include "seal/encryptionparams.h"
-#include "seal/memorymanager.h"
-#include "seal/publickey.h"
-#include "seal/valcheck.h"
+#include "encryptionparams.h"
+#include "memorymanager.h"
+#include "publickey.h"
+#include "valcheck.h"
 #include <iostream>
 #include <limits>
 #include <vector>

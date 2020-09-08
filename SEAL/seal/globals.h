@@ -3,8 +3,8 @@
 
 #pragma once
 
-#include "seal/util/defines.h"
-#include "seal/util/hestdparms.h"
+#include "defines.h"
+#include "hestdparms.h"
 #include <cstddef>
 #include <cstdint>
 #include <map>

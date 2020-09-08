@@ -3,12 +3,12 @@
 
 #pragma once
 
-#include "seal/memorymanager.h"
-#include "seal/plaintext.h"
-#include "seal/randomgen.h"
-#include "seal/valcheck.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
+#include "memorymanager.h"
+#include "plaintext.h"
+#include "randomgen.h"
+#include "valcheck.h"
+#include "common.h"
+#include "defines.h"
 #include <cstddef>
 #include <cstdint>
 #include <iostream>

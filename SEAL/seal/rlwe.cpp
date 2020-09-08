@@ -1,16 +1,16 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/ciphertext.h"
-#include "seal/randomgen.h"
-#include "seal/randomtostd.h"
-#include "seal/util/clipnormal.h"
-#include "seal/util/common.h"
-#include "seal/util/globals.h"
-#include "seal/util/ntt.h"
-#include "seal/util/polyarithsmallmod.h"
-#include "seal/util/polycore.h"
-#include "seal/util/rlwe.h"
+#include "ciphertext.h"
+#include "randomgen.h"
+#include "randomtostd.h"
+#include "clipnormal.h"
+#include "common.h"
+#include "globals.h"
+#include "ntt.h"
+#include "polyarithsmallmod.h"
+#include "polycore.h"
+#include "rlwe.h"
 
 using namespace std;
 

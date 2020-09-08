@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include "seal/util/blake2.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
+#include "blake2.h"
+#include "common.h"
+#include "defines.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>

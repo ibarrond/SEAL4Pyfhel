@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/util/streambuf.h"
+#include "streambuf.h"
 
 namespace seal
 {

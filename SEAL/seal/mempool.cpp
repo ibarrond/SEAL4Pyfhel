@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/util/common.h"
-#include "seal/util/mempool.h"
-#include "seal/util/uintarith.h"
+#include "common.h"
+#include "mempool.h"
+#include "uintarith.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>

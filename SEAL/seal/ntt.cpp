@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/util/ntt.h"
-#include "seal/util/uintarith.h"
-#include "seal/util/uintarithsmallmod.h"
+#include "ntt.h"
+#include "uintarith.h"
+#include "uintarithsmallmod.h"
 #include <algorithm>
 
 using namespace std;

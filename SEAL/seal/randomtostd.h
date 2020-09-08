@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "seal/randomgen.h"
+#include "randomgen.h"
 #include <cstdint>
 #include <limits>
 #include <memory>

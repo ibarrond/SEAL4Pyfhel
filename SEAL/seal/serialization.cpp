@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/context.h"
-#include "seal/intarray.h"
-#include "seal/memorymanager.h"
-#include "seal/serialization.h"
-#include "seal/util/common.h"
-#include "seal/util/streambuf.h"
-#include "seal/util/ztools.h"
+#include "context.h"
+#include "intarray.h"
+#include "memorymanager.h"
+#include "serialization.h"
+#include "common.h"
+#include "streambuf.h"
+#include "ztools.h"
 #include <algorithm>
 #include <stdexcept>
 #include <type_traits>

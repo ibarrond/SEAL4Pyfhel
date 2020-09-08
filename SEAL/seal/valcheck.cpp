@@ -1,16 +1,16 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/ciphertext.h"
-#include "seal/galoiskeys.h"
-#include "seal/kswitchkeys.h"
-#include "seal/plaintext.h"
-#include "seal/publickey.h"
-#include "seal/relinkeys.h"
-#include "seal/secretkey.h"
-#include "seal/valcheck.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
+#include "ciphertext.h"
+#include "galoiskeys.h"
+#include "kswitchkeys.h"
+#include "plaintext.h"
+#include "publickey.h"
+#include "relinkeys.h"
+#include "secretkey.h"
+#include "valcheck.h"
+#include "common.h"
+#include "defines.h"
 
 using namespace std;
 using namespace seal::util;

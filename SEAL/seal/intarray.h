@@ -3,18 +3,18 @@
 
 #pragma once
 
-#include "seal/memorymanager.h"
-#include "seal/serialization.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/pointer.h"
+#include "memorymanager.h"
+#include "serialization.h"
+#include "common.h"
+#include "defines.h"
+#include "pointer.h"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <type_traits>
 #ifdef SEAL_USE_MSGSL
-#include <gsl/span>
+#include "gsl_span.h"
 #endif
 
 namespace seal

@@ -3,11 +3,11 @@
 
 #pragma once
 
-#include "seal/modulus.h"
-#include "seal/util/defines.h"
-#include "seal/util/numth.h"
-#include "seal/util/pointer.h"
-#include "seal/util/uintarith.h"
+#include "modulus.h"
+#include "defines.h"
+#include "numth.h"
+#include "pointer.h"
+#include "uintarith.h"
 #include <cstdint>
 #include <type_traits>
 

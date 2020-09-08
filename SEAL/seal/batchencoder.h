@@ -3,16 +3,16 @@
 
 #pragma once
 
-#include "seal/context.h"
-#include "seal/plaintext.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/uintarithsmallmod.h"
-#include "seal/util/uintcore.h"
+#include "context.h"
+#include "plaintext.h"
+#include "common.h"
+#include "defines.h"
+#include "uintarithsmallmod.h"
+#include "uintcore.h"
 #include <limits>
 #include <vector>
 #ifdef SEAL_USE_MSGSL
-#include <gsl/span>
+#include "gsl_span.h"
 #endif
 
 namespace seal

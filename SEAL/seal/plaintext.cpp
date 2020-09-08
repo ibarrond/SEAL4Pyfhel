@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/plaintext.h"
-#include "seal/util/common.h"
+#include "plaintext.h"
+#include "common.h"
 
 using namespace std;
 using namespace seal::util;

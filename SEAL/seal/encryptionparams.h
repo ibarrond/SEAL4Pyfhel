@@ -3,14 +3,14 @@
 
 #pragma once
 
-#include "seal/memorymanager.h"
-#include "seal/modulus.h"
-#include "seal/randomgen.h"
-#include "seal/serialization.h"
-#include "seal/util/defines.h"
-#include "seal/util/globals.h"
-#include "seal/util/hash.h"
-#include "seal/util/ztools.h"
+#include "memorymanager.h"
+#include "modulus.h"
+#include "randomgen.h"
+#include "serialization.h"
+#include "defines.h"
+#include "globals.h"
+#include "hash.h"
+#include "ztools.h"
 #include <functional>
 #include <iostream>
 #include <memory>

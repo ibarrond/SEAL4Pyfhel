@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/util/defines.h"
+#include "defines.h"
 
 #ifdef SEAL_USE_ZLIB
 
-#include "seal/serialization.h"
-#include "seal/util/pointer.h"
-#include "seal/util/ztools.h"
+#include "serialization.h"
+#include "pointer.h"
+#include "ztools.h"
 #include <cmath>
 #include <cstddef>
 #include <cstring>

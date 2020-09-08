@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/intencoder.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/pointer.h"
-#include "seal/util/uintarithsmallmod.h"
+#include "intencoder.h"
+#include "common.h"
+#include "defines.h"
+#include "pointer.h"
+#include "uintarithsmallmod.h"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>

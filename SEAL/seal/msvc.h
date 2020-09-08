@@ -11,7 +11,7 @@
 #endif
 
 // Read in config.h
-#include "seal/util/config.h"
+#include "config.h"
 
 // Do not throw when Evaluator produces transparent ciphertexts
 //#undef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT

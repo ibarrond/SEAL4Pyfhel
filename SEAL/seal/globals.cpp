@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/modulus.h"
-#include "seal/util/globals.h"
+#include "modulus.h"
+#include "globals.h"
 #include <cstdint>
 
 using namespace std;

@@ -3,20 +3,20 @@
 
 #pragma once
 
-#include "seal/memorymanager.h"
-#include "seal/serialization.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/pointer.h"
-#include "seal/util/uintarith.h"
-#include "seal/util/uintarithmod.h"
-#include "seal/util/uintcore.h"
-#include "seal/util/ztools.h"
+#include "memorymanager.h"
+#include "serialization.h"
+#include "common.h"
+#include "defines.h"
+#include "pointer.h"
+#include "uintarith.h"
+#include "uintarithmod.h"
+#include "uintcore.h"
+#include "ztools.h"
 #include <cstdint>
 #include <iostream>
 #include <string>
 #ifdef SEAL_USE_MSGSL
-#include <gsl/span>
+#include "gsl_span.h"
 #endif
 
 namespace seal

@@ -3,15 +3,15 @@
 
 #pragma once
 
-#include "seal/context.h"
-#include "seal/encryptionparams.h"
-#include "seal/intarray.h"
-#include "seal/memorymanager.h"
-#include "seal/valcheck.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/polycore.h"
-#include "seal/util/ztools.h"
+#include "context.h"
+#include "encryptionparams.h"
+#include "intarray.h"
+#include "memorymanager.h"
+#include "valcheck.h"
+#include "common.h"
+#include "defines.h"
+#include "polycore.h"
+#include "ztools.h"
 #include <algorithm>
 #include <functional>
 #include <iostream>
@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <string>
 #ifdef SEAL_USE_MSGSL
-#include <gsl/span>
+#include "gsl_span.h"
 #endif
 
 namespace seal

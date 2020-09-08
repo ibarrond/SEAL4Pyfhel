@@ -1,16 +1,16 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/decryptor.h"
-#include "seal/valcheck.h"
-#include "seal/util/common.h"
-#include "seal/util/polyarithsmallmod.h"
-#include "seal/util/polycore.h"
-#include "seal/util/scalingvariant.h"
-#include "seal/util/uintarith.h"
-#include "seal/util/uintarithmod.h"
-#include "seal/util/uintarithsmallmod.h"
-#include "seal/util/uintcore.h"
+#include "decryptor.h"
+#include "valcheck.h"
+#include "common.h"
+#include "polyarithsmallmod.h"
+#include "polycore.h"
+#include "scalingvariant.h"
+#include "uintarith.h"
+#include "uintarithmod.h"
+#include "uintarithsmallmod.h"
+#include "uintcore.h"
 #include <algorithm>
 #include <stdexcept>
 

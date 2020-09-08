@@ -3,12 +3,12 @@
 
 #pragma once
 
-#include "seal/memorymanager.h"
-#include "seal/serialization.h"
-#include "seal/util/defines.h"
-#include "seal/util/hestdparms.h"
-#include "seal/util/uintcore.h"
-#include "seal/util/ztools.h"
+#include "memorymanager.h"
+#include "serialization.h"
+#include "defines.h"
+#include "hestdparms.h"
+#include "uintcore.h"
+#include "ztools.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>

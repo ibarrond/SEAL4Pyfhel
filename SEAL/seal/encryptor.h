@@ -3,16 +3,16 @@
 
 #pragma once
 
-#include "seal/ciphertext.h"
-#include "seal/context.h"
-#include "seal/encryptionparams.h"
-#include "seal/memorymanager.h"
-#include "seal/plaintext.h"
-#include "seal/publickey.h"
-#include "seal/secretkey.h"
-#include "seal/serializable.h"
-#include "seal/util/defines.h"
-#include "seal/util/ntt.h"
+#include "ciphertext.h"
+#include "context.h"
+#include "encryptionparams.h"
+#include "memorymanager.h"
+#include "plaintext.h"
+#include "publickey.h"
+#include "secretkey.h"
+#include "serializable.h"
+#include "defines.h"
+#include "ntt.h"
 #include <memory>
 #include <vector>
 

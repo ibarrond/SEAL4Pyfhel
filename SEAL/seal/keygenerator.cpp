@@ -1,18 +1,18 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/keygenerator.h"
-#include "seal/randomtostd.h"
-#include "seal/util/clipnormal.h"
-#include "seal/util/common.h"
-#include "seal/util/galois.h"
-#include "seal/util/ntt.h"
-#include "seal/util/polyarithsmallmod.h"
-#include "seal/util/polycore.h"
-#include "seal/util/rlwe.h"
-#include "seal/util/uintarith.h"
-#include "seal/util/uintarithsmallmod.h"
-#include "seal/util/uintcore.h"
+#include "keygenerator.h"
+#include "randomtostd.h"
+#include "clipnormal.h"
+#include "common.h"
+#include "galois.h"
+#include "ntt.h"
+#include "polyarithsmallmod.h"
+#include "polycore.h"
+#include "rlwe.h"
+#include "uintarith.h"
+#include "uintarithsmallmod.h"
+#include "uintcore.h"
 #include <algorithm>
 
 using namespace std;

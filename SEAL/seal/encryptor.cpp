@@ -1,21 +1,21 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/encryptor.h"
-#include "seal/modulus.h"
-#include "seal/randomgen.h"
-#include "seal/randomtostd.h"
-#include "seal/util/clipnormal.h"
-#include "seal/util/common.h"
-#include "seal/util/iterator.h"
-#include "seal/util/ntt.h"
-#include "seal/util/polyarithsmallmod.h"
-#include "seal/util/rlwe.h"
-#include "seal/util/scalingvariant.h"
-#include "seal/util/uintarith.h"
-#include "seal/util/uintarithmod.h"
-#include "seal/util/uintarithsmallmod.h"
-#include "seal/util/uintcore.h"
+#include "encryptor.h"
+#include "modulus.h"
+#include "randomgen.h"
+#include "randomtostd.h"
+#include "clipnormal.h"
+#include "common.h"
+#include "iterator.h"
+#include "ntt.h"
+#include "polyarithsmallmod.h"
+#include "rlwe.h"
+#include "scalingvariant.h"
+#include "uintarith.h"
+#include "uintarithmod.h"
+#include "uintarithsmallmod.h"
+#include "uintcore.h"
 #include <algorithm>
 #include <stdexcept>
 

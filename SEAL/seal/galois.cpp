@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/util/galois.h"
-#include "seal/util/numth.h"
-#include "seal/util/uintcore.h"
+#include "galois.h"
+#include "numth.h"
+#include "uintcore.h"
 
 using namespace std;
 

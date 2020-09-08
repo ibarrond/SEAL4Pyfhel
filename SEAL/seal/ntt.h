@@ -3,13 +3,13 @@
 
 #pragma once
 
-#include "seal/memorymanager.h"
-#include "seal/modulus.h"
-#include "seal/util/defines.h"
-#include "seal/util/iterator.h"
-#include "seal/util/pointer.h"
-#include "seal/util/uintarithsmallmod.h"
-#include "seal/util/uintcore.h"
+#include "memorymanager.h"
+#include "modulus.h"
+#include "defines.h"
+#include "iterator.h"
+#include "pointer.h"
+#include "uintarithsmallmod.h"
+#include "uintcore.h"
 #include <stdexcept>
 
 namespace seal

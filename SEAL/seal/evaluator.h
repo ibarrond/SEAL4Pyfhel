@@ -3,20 +3,20 @@
 
 #pragma once
 
-#include "seal/ciphertext.h"
-#include "seal/context.h"
-#include "seal/galoiskeys.h"
-#include "seal/kswitchkeys.h"
-#include "seal/memorymanager.h"
-#include "seal/modulus.h"
-#include "seal/plaintext.h"
-#include "seal/relinkeys.h"
-#include "seal/secretkey.h"
-#include "seal/valcheck.h"
-#include "seal/util/common.h"
-#include "seal/util/iterator.h"
-#include "seal/util/pointer.h"
-#include "seal/util/uintarithsmallmod.h"
+#include "ciphertext.h"
+#include "context.h"
+#include "galoiskeys.h"
+#include "kswitchkeys.h"
+#include "memorymanager.h"
+#include "modulus.h"
+#include "plaintext.h"
+#include "relinkeys.h"
+#include "secretkey.h"
+#include "valcheck.h"
+#include "common.h"
+#include "iterator.h"
+#include "pointer.h"
+#include "uintarithsmallmod.h"
 #include <map>
 #include <memory>
 #include <stdexcept>

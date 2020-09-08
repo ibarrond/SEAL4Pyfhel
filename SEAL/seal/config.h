@@ -38,11 +38,11 @@
 #define SEAL_USE_ZLIB
 
 // Handmade for Seal4Pyfhel by running Cmake . in Wondows10 and Ubuntu18 and comparing.
-#if defined(SEAL_COMPILER_MSVC)
+#if SEAL_COMPILER == SEAL_COMPILER_MSVC
 #define SEAL_USE_STD_FOR_EACH_N
 #define SEAL_USE__UMUL128
 #define SEAL_USE__BITSCANREVERSE64
-#elif defined(SEAL_COMPILER_GCC) || defined(SEAL_COMPILER_CLANG)
+#elif (SEAL_COMPILER == SEAL_COMPILER_GCC) || (SEAL_COMPILER == SEAL_COMPILER_CLANG)
 #define SEAL_USE___BUILTIN_CLZLL
 #define SEAL_USE___INT128
 #define SEAL_USE_EXPLICIT_BZERO

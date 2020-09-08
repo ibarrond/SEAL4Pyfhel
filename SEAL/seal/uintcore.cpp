@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/util/common.h"
-#include "seal/util/uintarith.h"
-#include "seal/util/uintcore.h"
+#include "common.h"
+#include "uintarith.h"
+#include "uintcore.h"
 #include <algorithm>
 #include <string>
 

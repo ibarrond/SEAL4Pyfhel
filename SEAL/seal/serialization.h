@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "seal/util/defines.h"
+#include "defines.h"
 #include <cstdint>
 #include <cstring>
 #include <functional>

@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "seal/util/defines.h"
+#include "defines.h"
 #include <cstddef>
 
 namespace seal

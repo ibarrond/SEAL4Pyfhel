@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/pointer.h"
-#include "seal/util/uintcore.h"
+#include "common.h"
+#include "defines.h"
+#include "pointer.h"
+#include "uintcore.h"
 #include <algorithm>
 #include <cstdint>
 #include <functional>

@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/util/uintarith.h"
-#include "seal/util/uintarithmod.h"
-#include "seal/util/uintarithsmallmod.h"
-#include "seal/util/uintcore.h"
+#include "uintarith.h"
+#include "uintarithmod.h"
+#include "uintarithsmallmod.h"
+#include "uintcore.h"
 #include <numeric>
 #include <random>
 #include <tuple>

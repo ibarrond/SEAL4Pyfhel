@@ -15,15 +15,17 @@ download:
 
 fix_original:
 	# Removing unnecesary files
-	@rm -rf SEALExamples SEALNETExamples SEALTest\
-		   SEALNET SEALNETTest SEAL.sln INSTALL.txt\
-	       SEAL/CMakeLists.txt SEAL/SEAL.vcxproj \
-		   SEAL/SEAL.vcxproj.filters SEAL/cmake
+	# @rm -rf SEALExamples SEALNETExamples SEALTest\
+	# 	   SEALNET SEALNETTest SEAL.sln INSTALL.txt\
+	#        SEAL/CMakeLists.txt SEAL/SEAL.vcxproj \
+	# 	   SEAL/SEAL.vcxproj.filters SEAL/cmake
 	# Updating README
-	@cp .SEAL4Pyfhel_README README.md 
+	# @cp .SEAL4Pyfhel_README README.md 
 	# Fixing errors in relative paths wrt. imports
-	@mv $(SRC_DIR)/util/* $(SRC_DIR)
+	# @mv $(SRC_DIR)/util/* $(SRC_DIR)
 	@find ./$(SRC_DIR) -name '*.*' -exec sed -i 's-"seal/-"-g' {} \;
 	@find ./$(SRC_DIR) -name '*.*' -exec sed -i 's-"util/-"-g' {} \;
+	@find ./$(SRC_DIR) -name '*.*' -exec sed -i -E 's-<gsl/(.*)>-"gsl/\1"-g' {} \;
+	@find ./$(SRC_DIR) -name '*.*' -exec sed -i -E 's-"gsl/-"gsl_-g' {} \;
 	# Including precompiled config.h
 	@cp config.h ./$(SRC_DIR)

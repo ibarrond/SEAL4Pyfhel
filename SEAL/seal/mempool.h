@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/globals.h"
-#include "seal/util/locks.h"
+#include "common.h"
+#include "defines.h"
+#include "globals.h"
+#include "locks.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>

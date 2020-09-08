@@ -11,7 +11,7 @@
 #endif
 
 // Read in config.h
-#include "seal/util/config.h"
+#include "config.h"
 
 // Are intrinsics enabled?
 #ifdef SEAL_USE_INTRIN

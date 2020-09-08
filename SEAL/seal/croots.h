@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include "seal/memorymanager.h"
-#include "seal/util/defines.h"
-#include "seal/util/uintcore.h"
+#include "memorymanager.h"
+#include "defines.h"
+#include "uintcore.h"
 #include <complex>
 #include <cstddef>
 #include <stdexcept>

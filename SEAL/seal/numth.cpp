@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/util/numth.h"
-#include "seal/util/uintarithsmallmod.h"
-#include "seal/util/uintcore.h"
+#include "numth.h"
+#include "uintarithsmallmod.h"
+#include "uintcore.h"
 #include <random>
 
 using namespace std;

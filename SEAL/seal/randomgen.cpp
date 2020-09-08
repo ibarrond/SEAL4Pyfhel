@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/randomgen.h"
-#include "seal/util/blake2.h"
+#include "randomgen.h"
+#include "blake2.h"
 #include <algorithm>
 #include <iostream>
 #include <random>

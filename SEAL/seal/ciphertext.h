@@ -3,14 +3,14 @@
 
 #pragma once
 
-#include "seal/context.h"
-#include "seal/intarray.h"
-#include "seal/memorymanager.h"
-#include "seal/randomgen.h"
-#include "seal/valcheck.h"
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/ztools.h"
+#include "context.h"
+#include "intarray.h"
+#include "memorymanager.h"
+#include "randomgen.h"
+#include "valcheck.h"
+#include "common.h"
+#include "defines.h"
+#include "ztools.h"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>

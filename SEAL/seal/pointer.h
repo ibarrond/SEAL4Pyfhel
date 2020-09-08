@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include "seal/util/common.h"
-#include "seal/util/defines.h"
-#include "seal/util/mempool.h"
+#include "common.h"
+#include "defines.h"
+#include "mempool.h"
 #include <iterator>
 #include <memory>
 #include <type_traits>

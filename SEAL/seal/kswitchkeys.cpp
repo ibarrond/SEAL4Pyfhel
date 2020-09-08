@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "seal/kswitchkeys.h"
-#include "seal/util/defines.h"
+#include "kswitchkeys.h"
+#include "defines.h"
 #include <stdexcept>
 
 using namespace std;
