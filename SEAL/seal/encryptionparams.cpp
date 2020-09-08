@@ -1,101 +1,159 @@
-#include "encryptionparams.h"
-#include "chooser.h"
-#include "polycore.h"
-#include "uintarith.h"
-#include "modulus.h"
-#include "polymodulus.h"
-#include "defaultparams.h"
-#include <stdexcept>
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
+#include "seal/encryptionparams.h"
+#include "seal/util/uintcore.h"
 #include <limits>
-#include <math.h>
 
 using namespace std;
 using namespace seal::util;
 
 namespace seal
 {
-    EncryptionParameters::EncryptionParameters() : poly_modulus_(1, 1)
+    const parms_id_type parms_id_zero = util::HashFunction::hash_zero_block;
+
+    void EncryptionParameters::save_members(ostream &stream) const
     {
-        // It is important to ensure that poly_modulus always has at least one coefficient
-        // and at least one uint64 per coefficient
-        compute_hash();
+        // Throw exceptions on std::ios_base::badbit and std::ios_base::failbit
+        auto old_except_mask = stream.exceptions();
+        try
+        {
+            stream.exceptions(ios_base::badbit | ios_base::failbit);
+
+            uint64_t poly_modulus_degree64 = static_cast<uint64_t>(poly_modulus_degree_);
+            uint64_t coeff_modulus_size64 = static_cast<uint64_t>(coeff_modulus_.size());
+            uint8_t scheme = static_cast<uint8_t>(scheme_);
+
+            stream.write(reinterpret_cast<const char *>(&scheme), sizeof(uint8_t));
+            stream.write(reinterpret_cast<const char *>(&poly_modulus_degree64), sizeof(uint64_t));
+            stream.write(reinterpret_cast<const char *>(&coeff_modulus_size64), sizeof(uint64_t));
+            for (const auto &mod : coeff_modulus_)
+            {
+                mod.save(stream, compr_mode_type::none);
+            }
+
+            // Only BFV uses plain_modulus but save it in any case for simplicity
+            plain_modulus_.save(stream, compr_mode_type::none);
+        }
+        catch (const ios_base::failure &)
+        {
+            stream.exceptions(old_except_mask);
+            throw runtime_error("I/O error");
+        }
+        catch (...)
+        {
+            stream.exceptions(old_except_mask);
+            throw;
+        }
+        stream.exceptions(old_except_mask);
     }
 
-    void EncryptionParameters::save(ostream &stream) const
+    void EncryptionParameters::load_members(istream &stream)
     {
-        int32_t coeff_mod_count32 = static_cast<int>(coeff_modulus_.size());
-
-        poly_modulus_.save(stream);
-        stream.write(reinterpret_cast<const char*>(&coeff_mod_count32), sizeof(int32_t));
-        for (int i = 0; i < coeff_mod_count32; i++)
+        // Throw exceptions on std::ios_base::badbit and std::ios_base::failbit
+        auto old_except_mask = stream.exceptions();
+        try
         {
-            coeff_modulus_[i].save(stream);
+            stream.exceptions(ios_base::badbit | ios_base::failbit);
+
+            // Read the scheme identifier
+            uint8_t scheme;
+            stream.read(reinterpret_cast<char *>(&scheme), sizeof(uint8_t));
+
+            // This constructor will throw if scheme is invalid
+            EncryptionParameters parms(scheme);
+
+            // Read the poly_modulus_degree
+            uint64_t poly_modulus_degree64 = 0;
+            stream.read(reinterpret_cast<char *>(&poly_modulus_degree64), sizeof(uint64_t));
+
+            // Only check for upper bound; lower bound is zero for scheme_type::none
+            if (poly_modulus_degree64 > SEAL_POLY_MOD_DEGREE_MAX)
+            {
+                throw logic_error("poly_modulus_degree is invalid");
+            }
+
+            // Read the coeff_modulus size
+            uint64_t coeff_modulus_size64 = 0;
+            stream.read(reinterpret_cast<char *>(&coeff_modulus_size64), sizeof(uint64_t));
+
+            // Only check for upper bound; lower bound is zero for scheme_type::none
+            if (coeff_modulus_size64 > SEAL_COEFF_MOD_COUNT_MAX)
+            {
+                throw logic_error("coeff_modulus is invalid");
+            }
+
+            // Read the coeff_modulus
+            vector<Modulus> coeff_modulus;
+            for (uint64_t i = 0; i < coeff_modulus_size64; i++)
+            {
+                coeff_modulus.emplace_back();
+                coeff_modulus.back().load(stream);
+            }
+
+            // Read the plain_modulus
+            Modulus plain_modulus;
+            plain_modulus.load(stream);
+
+            // Supposedly everything worked so set the values of member variables
+            parms.set_poly_modulus_degree(safe_cast<size_t>(poly_modulus_degree64));
+            parms.set_coeff_modulus(coeff_modulus);
+
+            // Only BFV uses plain_modulus; set_plain_modulus checks that for
+            // other schemes it is zero
+            parms.set_plain_modulus(plain_modulus);
+
+            // Set the loaded parameters
+            swap(*this, parms);
+
+            stream.exceptions(old_except_mask);
         }
-        plain_modulus_.save(stream);
-        stream.write(reinterpret_cast<const char*>(&noise_standard_deviation_), sizeof(double));
-        stream.write(reinterpret_cast<const char*>(&noise_max_deviation_), sizeof(double));
+        catch (const ios_base::failure &)
+        {
+            stream.exceptions(old_except_mask);
+            throw runtime_error("I/O error");
+        }
+        catch (...)
+        {
+            stream.exceptions(old_except_mask);
+            throw;
+        }
+        stream.exceptions(old_except_mask);
     }
 
-    void EncryptionParameters::load(istream &stream)
-    {        
-        poly_modulus_.load(stream);
-        if (poly_modulus_.coeff_count() > SEAL_POLY_MOD_DEGREE_BOUND + 1 ||
-            poly_modulus_.coeff_uint64_count() > 1)
-        {
-            throw std::invalid_argument("poly_modulus too large");
-        }
-
-        int32_t coeff_mod_count32 = 0;
-        stream.read(reinterpret_cast<char*>(&coeff_mod_count32), sizeof(int32_t));
-        if (coeff_mod_count32 > SEAL_COEFF_MOD_COUNT_BOUND || coeff_mod_count32 < 0)
-        {
-            throw std::invalid_argument("coeff_modulus too large");
-        }
-        coeff_modulus_.resize(coeff_mod_count32);
-        for (int i = 0; i < coeff_mod_count32; i++)
-        {
-            coeff_modulus_[i].load(stream);
-        }
-
-        plain_modulus_.load(stream);
-
-        stream.read(reinterpret_cast<char*>(&noise_standard_deviation_), sizeof(double));
-        stream.read(reinterpret_cast<char*>(&noise_max_deviation_), sizeof(double));
-
-        // Re-compute the hash
-        compute_hash();
-    }
-
-    void EncryptionParameters::compute_hash()
+    void EncryptionParameters::compute_parms_id()
     {
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
+        size_t coeff_modulus_size = coeff_modulus_.size();
 
-        int total_uint64_count = 
-            poly_modulus_.coeff_uint64_count() * poly_modulus_.coeff_count() +
-            coeff_mod_count + 
-            plain_modulus_.uint64_count() +
-            1 + // noise_standard_deviation
-            1; // noise_max_deviation
+        size_t total_uint64_count = add_safe(
+            size_t(1), // scheme
+            size_t(1), // poly_modulus_degree
+            coeff_modulus_size, plain_modulus_.uint64_count());
 
-        Pointer param_data(allocate_uint(total_uint64_count, MemoryPoolHandle::Global()));
+        auto param_data(allocate_uint(total_uint64_count, pool_));
         uint64_t *param_data_ptr = param_data.get();
 
-        set_poly_poly(poly_modulus_.data(), poly_modulus_.coeff_count(), 
-            poly_modulus_.coeff_uint64_count(), param_data_ptr);
-        param_data_ptr += poly_modulus_.coeff_uint64_count() * poly_modulus_.coeff_count();
+        // Write the scheme identifier
+        *param_data_ptr++ = static_cast<uint64_t>(scheme_);
 
-        for (int i = 0; i < coeff_mod_count; i++)
+        // Write the poly_modulus_degree. Note that it will always be positive.
+        *param_data_ptr++ = static_cast<uint64_t>(poly_modulus_degree_);
+
+        for (const auto &mod : coeff_modulus_)
         {
-            *param_data_ptr = coeff_modulus_[i].value();
-            param_data_ptr++;
+            *param_data_ptr++ = mod.value();
         }
 
-        set_uint_uint(plain_modulus_.data(), plain_modulus_.uint64_count(), param_data_ptr);
+        set_uint(plain_modulus_.data(), plain_modulus_.uint64_count(), param_data_ptr);
         param_data_ptr += plain_modulus_.uint64_count();
 
-        memcpy(param_data_ptr++, &noise_standard_deviation_, sizeof(double));
-        memcpy(param_data_ptr, &noise_max_deviation_, sizeof(double));
+        HashFunction::hash(param_data.get(), total_uint64_count, parms_id_);
 
-        HashFunction::sha3_hash(param_data.get(), total_uint64_count, hash_block_);
+        // Did we somehow manage to get a zero block as result? This is reserved for
+        // plaintexts to indicate non-NTT-transformed form.
+        if (parms_id_ == parms_id_zero)
+        {
+            throw logic_error("parms_id cannot be zero");
+        }
     }
-}
+} // namespace seal

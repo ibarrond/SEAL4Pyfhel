@@ -1,252 +1,216 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
+#include "seal/decryptor.h"
+#include "seal/valcheck.h"
+#include "seal/util/common.h"
+#include "seal/util/polyarithsmallmod.h"
+#include "seal/util/polycore.h"
+#include "seal/util/scalingvariant.h"
+#include "seal/util/uintarith.h"
+#include "seal/util/uintarithmod.h"
+#include "seal/util/uintarithsmallmod.h"
+#include "seal/util/uintcore.h"
 #include <algorithm>
 #include <stdexcept>
-#include "decryptor.h"
-#include "common.h"
-#include "uintcore.h"
-#include "uintarith.h"
-#include "uintarithmod.h"
-#include "uintarithsmallmod.h"
-#include "polycore.h"
-#include "polyarithmod.h"
-#include "polyarithsmallmod.h"
-#include "polyfftmultsmallmod.h"
 
 using namespace std;
 using namespace seal::util;
 
 namespace seal
 {
-    Decryptor::Decryptor(const SEALContext &context, const SecretKey &secret_key) :
-        parms_(context.parms()), qualifiers_(context.qualifiers()), base_converter_(context.base_converter_)
+    namespace
+    {
+        void poly_infty_norm_coeffmod(
+            StrideIter<const uint64_t *> poly, size_t coeff_count, const uint64_t *modulus, uint64_t *result,
+            MemoryPool &pool)
+        {
+            size_t coeff_uint64_count = poly.stride();
+
+            // Construct negative threshold: (modulus + 1) / 2
+            auto modulus_neg_threshold(allocate_uint(coeff_uint64_count, pool));
+            half_round_up_uint(modulus, coeff_uint64_count, modulus_neg_threshold.get());
+
+            // Mod out the poly coefficients and choose a symmetric representative from [-modulus,modulus)
+            set_zero_uint(coeff_uint64_count, result);
+            auto coeff_abs_value(allocate_uint(coeff_uint64_count, pool));
+            SEAL_ITERATE(poly, coeff_count, [&](auto I) {
+                if (is_greater_than_or_equal_uint(I, modulus_neg_threshold.get(), coeff_uint64_count))
+                {
+                    sub_uint(modulus, I, coeff_uint64_count, coeff_abs_value.get());
+                }
+                else
+                {
+                    set_uint(I, coeff_uint64_count, coeff_abs_value.get());
+                }
+
+                if (is_greater_than_uint(coeff_abs_value.get(), result, coeff_uint64_count))
+                {
+                    // Store the new max
+                    set_uint(coeff_abs_value.get(), coeff_uint64_count, result);
+                }
+            });
+        }
+    } // namespace
+
+    Decryptor::Decryptor(shared_ptr<SEALContext> context, const SecretKey &secret_key) : context_(move(context))
     {
         // Verify parameters
-        if (!qualifiers_.parameters_set)
+        if (!context_)
+        {
+            throw invalid_argument("invalid context");
+        }
+        if (!context_->parameters_set())
         {
             throw invalid_argument("encryption parameters are not set correctly");
         }
-        if (secret_key.hash_block_ != parms_.hash_block())
+        if (!is_valid_for(secret_key, context_))
         {
             throw invalid_argument("secret key is not valid for encryption parameters");
         }
-        
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int poly_coeff_uint64_count = parms_.poly_modulus().coeff_uint64_count();
-        int coeff_mod_count = base_converter_.coeff_base_mod_count();
 
-        // Set SmallNTTTables
-        small_ntt_tables_.resize(coeff_mod_count);
-        small_ntt_tables_ = context.small_ntt_tables_;
+        auto &parms = context_->key_context_data()->parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
 
-        // Populate coeff products array for compose functions (used in noise budget)
-        coeff_products_array_ = allocate_uint(coeff_mod_count * coeff_mod_count, pool_);
-        Pointer tmp_coeff(allocate_uint(coeff_mod_count, pool_));
-        set_zero_uint(coeff_mod_count * coeff_mod_count, coeff_products_array_.get());
-
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            coeff_products_array_[i * coeff_mod_count] = 1;
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                if (i != j)
-                {
-                    multiply_uint_uint64(coeff_products_array_.get() + (i * coeff_mod_count), coeff_mod_count, parms_.coeff_modulus()[j].value(), coeff_mod_count, tmp_coeff.get());
-                    set_uint_uint(tmp_coeff.get(), coeff_mod_count, coeff_products_array_.get() + (i * coeff_mod_count));
-                }
-            }
-        }
-
-        // Allocate secret_key_ and copy over value
-        secret_key_ = allocate_poly(coeff_count, coeff_mod_count, pool_);
-        set_poly_poly(secret_key.data().data(), coeff_count, coeff_mod_count, secret_key_.get());
-
-        // Set the secret_key_array to have size 1 (first power of secret) 
-        secret_key_array_ = allocate_poly(coeff_count, coeff_mod_count, pool_);
-        set_poly_poly(secret_key_.get(), coeff_count, coeff_mod_count, secret_key_array_.get());
+        // Set the secret_key_array to have size 1 (first power of secret)
+        // and copy over data
+        secret_key_array_ = allocate_poly(coeff_count, coeff_modulus_size, pool_);
+        set_poly(secret_key.data().data(), coeff_count, coeff_modulus_size, secret_key_array_.get());
         secret_key_array_size_ = 1;
-
-        // Set the big coeff modulus for noise computation
-        product_modulus_ = allocate_uint(coeff_mod_count, pool_);
-        set_uint_uint(context.total_coeff_modulus().data(), coeff_mod_count, product_modulus_.get());
-
-        // Initialize moduli.
-        mod_ = Modulus(product_modulus_.get(), coeff_mod_count);
-        polymod_ = PolyModulus(parms_.poly_modulus().data(), coeff_count, poly_coeff_uint64_count);
     }
 
-    Decryptor::Decryptor(const Decryptor &copy) :
-        pool_(copy.pool_), parms_(copy.parms_), qualifiers_(copy.qualifiers_),
-        base_converter_(copy.base_converter_), 
-        small_ntt_tables_(copy.small_ntt_tables_),
-        secret_key_array_size_(copy.secret_key_array_size_)
+    void Decryptor::decrypt(const Ciphertext &encrypted, Plaintext &destination)
     {
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int poly_coeff_uint64_count = parms_.poly_modulus().coeff_uint64_count();
-        int coeff_mod_count = base_converter_.coeff_base_mod_count();
-
-        // Populate coeff products array for compose functions (used in noise budget)
-        coeff_products_array_ = allocate_uint(coeff_mod_count * coeff_mod_count, pool_);
-        set_poly_poly(copy.coeff_products_array_.get(), coeff_mod_count, coeff_mod_count, coeff_products_array_.get());
-
-        // Allocate secret_key_ and copy over value
-        secret_key_ = allocate_poly(coeff_count, coeff_mod_count, pool_);
-        set_poly_poly(copy.secret_key_.get(), coeff_count, coeff_mod_count, secret_key_.get());
-
-        // Allocate secret_key_array_ and copy over value
-        secret_key_array_ = allocate_poly(secret_key_array_size_ * coeff_count, coeff_mod_count, pool_);
-        set_poly_poly(copy.secret_key_array_.get(), secret_key_array_size_ * coeff_count, coeff_mod_count, secret_key_array_.get());
-
-        // Set the big coeff modulus for noise computation
-        product_modulus_ = allocate_uint(coeff_mod_count, pool_);
-        set_uint_uint(copy.product_modulus_.get(), coeff_mod_count, product_modulus_.get());
-
-        // Initialize moduli.
-        mod_ = Modulus(product_modulus_.get(), coeff_mod_count);
-        polymod_ = PolyModulus(parms_.poly_modulus().data(), coeff_count, poly_coeff_uint64_count);
-    }
-
-    void Decryptor::decrypt(const Ciphertext &encrypted, Plaintext &destination, const MemoryPoolHandle &pool)
-    {
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = base_converter_.coeff_base_mod_count();
-        int array_poly_uint64_count = coeff_count * coeff_mod_count;
-        int encrypted_size = encrypted.size();
-        
-        // The number of uint64 count for plain_modulus and gamma together
-        int plain_gamma_uint64_count = 2;
-
-        // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
+        // Verify that encrypted is valid.
+        if (!is_valid_for(encrypted, context_))
         {
             throw invalid_argument("encrypted is not valid for encryption parameters");
         }
-        if (!pool)
+
+        // Additionally check that ciphertext doesn't have trivial size
+        if (encrypted.size() < SEAL_CIPHERTEXT_SIZE_MIN)
         {
-            throw invalid_argument("pool is uninitialized");
+            throw invalid_argument("encrypted is empty");
         }
 
-        // Allocate a full size destination to write to
-        Pointer wide_destination(allocate_uint(coeff_count, pool));
+        auto &context_data = *context_->first_context_data();
+        auto &parms = context_data.parms();
 
-        // Make sure we have enough secret key powers computed
-        compute_secret_key_array(encrypted_size - 1);
-
-        /*
-        Firstly find c_0 + c_1 *s + ... + c_{count-1} * s^{count-1} mod q
-        This is equal to Delta m + v where ||v|| < Delta/2.
-        So, add Delta / 2 and now we have something which is Delta * (m + epsilon) where epsilon < 1
-        Therefore, we can (integer) divide by Delta and the answer will round down to m.
-        */
-
-        // Make a temp destination for all the arithmetic mod qi before calling FastBConverse
-        Pointer tmp_dest_modq(allocate_zero_poly(coeff_count, coeff_mod_count, pool));
-
-        // put < (c_1 , c_2, ... , c_{count-1}) , (s,s^2,...,s^{count-1}) > mod q in destination
-
-        // Now do the dot product of encrypted_copy and the secret key array using NTT. The secret key powers are already NTT transformed.
-        Pointer copy_operand1(allocate_uint(coeff_count, pool));
-        for (int i = 0; i < coeff_mod_count; i++)
+        switch (parms.scheme())
         {
-            // Initialize pointers for multiplication
-            const uint64_t *current_array1 = encrypted.data(1) + (i * coeff_count);
-            const uint64_t *current_array2 = secret_key_array_.get() + (i * coeff_count);
+        case scheme_type::BFV:
+            bfv_decrypt(encrypted, destination, pool_);
+            return;
 
-            for (int j = 0; j < encrypted_size - 1; j++)
-            {
-                // Perform the dyadic product. 
-                set_uint_uint(current_array1, coeff_count, copy_operand1.get());
+        case scheme_type::CKKS:
+            ckks_decrypt(encrypted, destination, pool_);
+            return;
 
-                // Lazy reduction
-                ntt_negacyclic_harvey_lazy(copy_operand1.get(), small_ntt_tables_[i]);
-
-                dyadic_product_coeffmod(copy_operand1.get(), current_array2, coeff_count, small_ntt_tables_[i].modulus(), copy_operand1.get());
-                add_poly_poly_coeffmod(tmp_dest_modq.get() + (i * coeff_count), copy_operand1.get(), coeff_count, small_ntt_tables_[i].modulus(), 
-                    tmp_dest_modq.get() + (i * coeff_count));
-
-                current_array1 += array_poly_uint64_count;
-                current_array2 += array_poly_uint64_count;
-            }
-
-            // Perform inverse NTT
-            inverse_ntt_negacyclic_harvey(tmp_dest_modq.get() + (i * coeff_count), small_ntt_tables_[i]);
+        default:
+            throw invalid_argument("unsupported scheme");
         }
-
-        // add c_0 into destination
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            //add_poly_poly_coeffmod(tmp_dest_modq.get() + (i * coeff_count), encrypted.data() + (i * coeff_count), 
-            //    coeff_count, coeff_modulus_[i], tmp_dest_modq.get() + (i * coeff_count));
-
-            // Lazy reduction
-            for (int j = 0; j < coeff_count; j++)
-            {
-                tmp_dest_modq[j + (i * coeff_count)] += encrypted[j + (i * coeff_count)];
-            }
-
-            // Compute |gamma * plain|qi * ct(s)
-            multiply_poly_scalar_coeffmod(tmp_dest_modq.get() + (i * coeff_count), coeff_count, 
-                base_converter_.get_plain_gamma_product()[i], parms_.coeff_modulus()[i], tmp_dest_modq.get() + (i * coeff_count));
-        }
-        
-        // Make another temp destination to get the poly in mod {gamma U plain_modulus}
-        Pointer tmp_dest_plain_gamma(allocate_poly(coeff_count, plain_gamma_uint64_count, pool));
-
-        // Compute FastBConvert from q to {gamma, plain_modulus}
-        base_converter_.fastbconv_plain_gamma(tmp_dest_modq.get(), tmp_dest_plain_gamma.get(), pool);
-        
-        // Compute result multiply by coeff_modulus inverse in mod {gamma U plain_modulus}
-        for (int i = 0; i < plain_gamma_uint64_count; i++)
-        {
-            multiply_poly_scalar_coeffmod(tmp_dest_plain_gamma.get() + (i * coeff_count), coeff_count, 
-                base_converter_.get_neg_inv_coeff()[i], base_converter_.get_plain_gamma_array()[i], tmp_dest_plain_gamma.get() + (i * coeff_count));
-        }
-
-        // First correct the values which are larger than floor(gamma/2)
-        uint64_t gamma_div_2 = base_converter_.get_plain_gamma_array()[1].value() >> 1;
-
-        // Now compute the subtraction to remove error and perform final multiplication by gamma inverse mod plain_modulus
-        for (int i = 0; i < coeff_count; i++)
-        {
-            // Need correction beacuse of center mod
-            if (tmp_dest_plain_gamma[i + coeff_count] > gamma_div_2)
-            {
-                // Compute -(gamma - a) instead of (a - gamma)
-                tmp_dest_plain_gamma[i + coeff_count] = base_converter_.get_plain_gamma_array()[1].value() - tmp_dest_plain_gamma[i + coeff_count];
-                tmp_dest_plain_gamma[i + coeff_count] %= base_converter_.get_plain_gamma_array()[0].value();
-                wide_destination[i] = add_uint_uint_mod(tmp_dest_plain_gamma[i], tmp_dest_plain_gamma[i + coeff_count], 
-                    base_converter_.get_plain_gamma_array()[0]);
-            }
-            // No correction needed
-            else
-            {
-                tmp_dest_plain_gamma[i + coeff_count] %= base_converter_.get_plain_gamma_array()[0].value();
-                wide_destination[i] = sub_uint_uint_mod(tmp_dest_plain_gamma[i], tmp_dest_plain_gamma[i + coeff_count], 
-                    base_converter_.get_plain_gamma_array()[0]);
-            }
-        }
-
-        // How many non-zero coefficients do we really have in the result?
-        int plain_coeff_count = get_significant_uint64_count_uint(wide_destination.get(), coeff_count);
-
-        // Resize destination to appropriate size
-        destination.resize(plain_coeff_count);
-
-        // Perform final multiplication by gamma inverse mod plain_modulus
-        multiply_poly_scalar_coeffmod(wide_destination.get(), plain_coeff_count, base_converter_.get_inv_gamma(), 
-            base_converter_.get_plain_gamma_array()[0], destination.data());
     }
 
-    void Decryptor::compute_secret_key_array(int max_power)
+    void Decryptor::bfv_decrypt(const Ciphertext &encrypted, Plaintext &destination, MemoryPoolHandle pool)
+    {
+        if (encrypted.is_ntt_form())
+        {
+            throw invalid_argument("encrypted cannot be in NTT form");
+        }
+
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+
+        // Firstly find c_0 + c_1 *s + ... + c_{count-1} * s^{count-1} mod q
+        // This is equal to Delta m + v where ||v|| < Delta/2.
+        // Add Delta / 2 and now we have something which is Delta * (m + epsilon) where epsilon < 1
+        // Therefore, we can (integer) divide by Delta and the answer will round down to m.
+
+        // Make a temp destination for all the arithmetic mod qi before calling FastBConverse
+        SEAL_ALLOCATE_ZERO_GET_RNS_ITER(tmp_dest_modq, coeff_count, coeff_modulus_size, pool);
+
+        // put < (c_1 , c_2, ... , c_{count-1}) , (s,s^2,...,s^{count-1}) > mod q in destination
+        // Now do the dot product of encrypted_copy and the secret key array using NTT.
+        // The secret key powers are already NTT transformed.
+        dot_product_ct_sk_array(encrypted, tmp_dest_modq, pool_);
+
+        // Allocate a full size destination to write to
+        destination.parms_id() = parms_id_zero;
+        destination.resize(coeff_count);
+
+        // Divide scaling variant using BEHZ FullRNS techniques
+        context_data.rns_tool()->decrypt_scale_and_round(tmp_dest_modq, destination.data(), pool);
+
+        // How many non-zero coefficients do we really have in the result?
+        size_t plain_coeff_count = get_significant_uint64_count_uint(destination.data(), coeff_count);
+
+        // Resize destination to appropriate size
+        destination.resize(max(plain_coeff_count, size_t(1)));
+    }
+
+    void Decryptor::ckks_decrypt(const Ciphertext &encrypted, Plaintext &destination, MemoryPoolHandle pool)
+    {
+        if (!encrypted.is_ntt_form())
+        {
+            throw invalid_argument("encrypted must be in NTT form");
+        }
+
+        // We already know that the parameters are valid
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+        size_t rns_poly_uint64_count = mul_safe(coeff_count, coeff_modulus_size);
+
+        // Decryption consists in finding
+        // c_0 + c_1 *s + ... + c_{count-1} * s^{count-1} mod q_1 * q_2 * q_3
+        // as long as ||m + v|| < q_1 * q_2 * q_3.
+        // This is equal to m + v where ||v|| is small enough.
+
+        // Since we overwrite destination, we zeroize destination parameters
+        // This is necessary, otherwise resize will throw an exception.
+        destination.parms_id() = parms_id_zero;
+
+        // Resize destination to appropriate size
+        destination.resize(rns_poly_uint64_count);
+
+        // Do the dot product of encrypted and the secret key array using NTT.
+        dot_product_ct_sk_array(encrypted, RNSIter(destination.data(), coeff_count), pool);
+
+        // Set destination parameters as in encrypted
+        destination.parms_id() = encrypted.parms_id();
+        destination.scale() = encrypted.scale();
+    }
+
+    void Decryptor::compute_secret_key_array(size_t max_power)
     {
 #ifdef SEAL_DEBUG
         if (max_power < 1)
         {
             throw invalid_argument("max_power must be at least 1");
         }
+        if (!secret_key_array_size_ || !secret_key_array_)
+        {
+            throw logic_error("secret_key_array_ is uninitialized");
+        }
 #endif
+        // WARNING: This function must be called with the original context_data
+        auto &context_data = *context_->key_context_data();
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+
         ReaderLock reader_lock(secret_key_array_locker_.acquire_read());
 
-        int old_size = secret_key_array_size_;
-        int new_size = max(max_power, old_size);
+        size_t old_size = secret_key_array_size_;
+        size_t new_size = max(max_power, old_size);
 
         if (old_size == new_size)
         {
@@ -255,32 +219,22 @@ namespace seal
 
         reader_lock.unlock();
 
-        // Need to extend the array 
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(parms_.coeff_modulus().size());
-
+        // Need to extend the array
         // Compute powers of secret key until max_power
-        Pointer new_secret_key_array(allocate_poly(new_size * coeff_count, coeff_mod_count, pool_));
-        set_poly_poly(secret_key_array_.get(), old_size * coeff_count, coeff_mod_count, new_secret_key_array.get());
+        auto secret_key_array(allocate_poly_array(new_size, coeff_count, coeff_modulus_size, pool_));
+        PolyIter secret_key_array_iter(secret_key_array.get(), coeff_count, coeff_modulus_size);
+        set_poly_array(secret_key_array_.get(), old_size, coeff_count, coeff_modulus_size, secret_key_array_iter);
 
-        int poly_ptr_increment = coeff_count * coeff_mod_count;
-        uint64_t *prev_poly_ptr = new_secret_key_array.get() + (old_size - 1) * poly_ptr_increment;
-        uint64_t *next_poly_ptr = prev_poly_ptr + poly_ptr_increment;
+        // Since all of the key powers in secret_key_array_ are already NTT transformed,
+        // to get the next one we simply need to compute a dyadic product of the last
+        // one with the first one [which is equal to NTT(secret_key_)].
+        SEAL_ITERATE(
+            iter(secret_key_array_iter + (old_size - 1), secret_key_array_iter + old_size), new_size - old_size,
+            [&](auto I) {
+                dyadic_product_coeffmod(
+                    get<0>(I), *secret_key_array_iter, coeff_modulus_size, coeff_modulus, get<1>(I));
+            });
 
-        // Since all of the key powers in secret_key_array_ are already NTT transformed, to get the next one 
-        // we simply need to compute a dyadic product of the last one with the first one [which is equal to NTT(secret_key_)].
-        for (int i = old_size; i < new_size; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                dyadic_product_coeffmod(prev_poly_ptr + (j * coeff_count), new_secret_key_array.get() + (j * coeff_count),
-                    coeff_count, parms_.coeff_modulus()[j], next_poly_ptr + (j * coeff_count));
-            }
-            prev_poly_ptr = next_poly_ptr;
-            next_poly_ptr += poly_ptr_increment;
-        }
-
-        
         // Take writer lock to update array
         WriterLock writer_lock(secret_key_array_locker_.acquire_write());
 
@@ -295,134 +249,123 @@ namespace seal
 
         // Acquire new array
         secret_key_array_size_ = new_size;
-        secret_key_array_.acquire(new_secret_key_array);
+        secret_key_array_.acquire(move(secret_key_array));
     }
 
-    void Decryptor::compose(uint64_t *value)
+    // Compute c_0 + c_1 *s + ... + c_{count-1} * s^{count-1} mod q.
+    // Store result in destination in RNS form.
+    void Decryptor::dot_product_ct_sk_array(const Ciphertext &encrypted, RNSIter destination, MemoryPoolHandle pool)
     {
-#ifdef SEAL_DEBUG
-        if (value == nullptr)
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+        size_t key_coeff_modulus_size = context_->key_context_data()->parms().coeff_modulus().size();
+        size_t encrypted_size = encrypted.size();
+        auto is_ntt_form = encrypted.is_ntt_form();
+
+        auto ntt_tables = context_data.small_ntt_tables();
+
+        // Make sure we have enough secret key powers computed
+        compute_secret_key_array(encrypted_size - 1);
+
+        // put < (c_1 , c_2, ... , c_{count-1}) , (s,s^2,...,s^{count-1}) > mod q in destination
+        // Now do the dot product of encrypted_copy and the secret key array using NTT.
+        // The secret key powers are already NTT transformed.
+
+        SEAL_ALLOCATE_GET_POLY_ITER(encrypted_copy, encrypted_size - 1, coeff_count, coeff_modulus_size, pool);
+        set_poly_array(encrypted.data(1), encrypted_size - 1, coeff_count, coeff_modulus_size, encrypted_copy);
+
+        // Transform c_1, c_2, ... to NTT form unless they already are
+        if (!is_ntt_form)
         {
-            throw invalid_argument("input cannot be null");
+            ntt_negacyclic_harvey_lazy(encrypted_copy, encrypted_size - 1, ntt_tables);
         }
-#endif
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(parms_.coeff_modulus().size());
-        int total_uint64_count = coeff_mod_count * coeff_count;
 
-        // Set temporary coefficients_ptr pointer to point to either an existing allocation given as parameter,
-        // or else to a new allocation from the memory pool.
-        Pointer coefficients(allocate_uint(total_uint64_count, pool_));
-        uint64_t *coefficients_ptr = coefficients.get();
+        // Compute dyadic product with secret power array
+        auto secret_key_array = PolyIter(secret_key_array_.get(), coeff_count, key_coeff_modulus_size);
+        SEAL_ITERATE(iter(encrypted_copy, secret_key_array), encrypted_size - 1, [&](auto I) {
+            dyadic_product_coeffmod(get<0>(I), get<1>(I), coeff_modulus_size, coeff_modulus, get<0>(I));
+        });
 
-        // Re-merge the coefficients first
-        for (int i = 0; i < coeff_count; i++)
+        // Aggregate all polynomials together to complete the dot product
+        set_zero_poly(coeff_count, coeff_modulus_size, destination);
+        SEAL_ITERATE(encrypted_copy, encrypted_size - 1, [&](auto I) {
+            add_poly_coeffmod(destination, I, coeff_modulus_size, coeff_modulus, destination);
+        });
+
+        if (!is_ntt_form)
         {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                coefficients_ptr[j + (i * coeff_mod_count)] = value[(j * coeff_count) + i];
-            }
+            // If the input was not in NTT form, need to transform back
+            inverse_ntt_negacyclic_harvey(destination, coeff_modulus_size, ntt_tables);
         }
 
-        Pointer temp(allocate_uint(coeff_mod_count, pool_));
-        set_zero_uint(total_uint64_count, value);
-
-        for (int i = 0; i < coeff_count; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                uint64_t tmp = multiply_uint_uint_mod(coefficients_ptr[j], base_converter_.get_inv_coeff_mod_coeff_array()[j], parms_.coeff_modulus()[j]);
-                multiply_uint_uint64(coeff_products_array_.get() + (j * coeff_mod_count), coeff_mod_count, tmp, coeff_mod_count, temp.get());
-                add_uint_uint_mod(temp.get(), value + (i * coeff_mod_count), mod_.get(), coeff_mod_count, value + (i * coeff_mod_count));
-            }
-            set_zero_uint(coeff_mod_count, temp.get());
-            coefficients_ptr += coeff_mod_count;
-        }
+        // Finally add c_0 to the result; note that destination should be in the same (NTT) form as encrypted
+        add_poly_coeffmod(destination, *iter(encrypted), coeff_modulus_size, coeff_modulus, destination);
     }
 
-    int Decryptor::invariant_noise_budget(const Ciphertext &encrypted, const MemoryPoolHandle &pool)
+    int Decryptor::invariant_noise_budget(const Ciphertext &encrypted)
     {
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(parms_.coeff_modulus().size());
-        int array_poly_uint64_count = coeff_count * coeff_mod_count;
-        int encrypted_size = encrypted.size();
-
-        // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
+        // Verify that encrypted is valid.
+        if (!is_valid_for(encrypted, context_))
         {
             throw invalid_argument("encrypted is not valid for encryption parameters");
         }
-        if (!pool)
+
+        // Additionally check that ciphertext doesn't have trivial size
+        if (encrypted.size() < SEAL_CIPHERTEXT_SIZE_MIN)
         {
-            throw invalid_argument("pool is uninitialized");
+            throw invalid_argument("encrypted is empty");
         }
 
-        // Storage for noise uint
-        Pointer destination(allocate_uint(coeff_mod_count, pool));
+        if (context_->key_context_data()->parms().scheme() != scheme_type::BFV)
+        {
+            throw logic_error("unsupported scheme");
+        }
+        if (encrypted.is_ntt_form())
+        {
+            throw invalid_argument("encrypted cannot be in NTT form");
+        }
+
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        auto &plain_modulus = parms.plain_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+
+        // Storage for the infinity norm of noise poly
+        auto norm(allocate_uint(coeff_modulus_size, pool_));
 
         // Storage for noise poly
-        Pointer noise_poly(allocate_zero_poly(coeff_count, coeff_mod_count, pool));
+        SEAL_ALLOCATE_ZERO_GET_RNS_ITER(noise_poly, coeff_count, coeff_modulus_size, pool_);
 
         // Now need to compute c(s) - Delta*m (mod q)
+        // Firstly find c_0 + c_1 *s + ... + c_{count-1} * s^{count-1} mod q
+        // This is equal to Delta m + v where ||v|| < Delta/2.
+        // put < (c_1 , c_2, ... , c_{count-1}) , (s,s^2,...,s^{count-1}) > mod q
+        // in destination_poly.
+        // Now do the dot product of encrypted_copy and the secret key array using NTT.
+        // The secret key powers are already NTT transformed.
+        dot_product_ct_sk_array(encrypted, noise_poly, pool_);
 
-        // Make sure we have enough secret keys computed
-        compute_secret_key_array(encrypted_size - 1);
+        // Multiply by plain_modulus and reduce mod coeff_modulus to get
+        // coeff_modulus()*noise.
+        multiply_poly_scalar_coeffmod(noise_poly, coeff_modulus_size, plain_modulus.value(), coeff_modulus, noise_poly);
 
-        /*
-        Firstly find c_0 + c_1 *s + ... + c_{count-1} * s^{count-1} mod q
-        This is equal to Delta m + v where ||v|| < Delta/2.
-        */
-        // put < (c_1 , c_2, ... , c_{count-1}) , (s,s^2,...,s^{count-1}) > mod q in destination_poly
-        // Make a copy of the encrypted BigPolyArray for NTT (except the first polynomial is not needed)
-        Pointer encrypted_copy(allocate_poly((encrypted_size - 1) * coeff_count, coeff_mod_count, pool));
-        set_poly_poly(encrypted.data(1), (encrypted_size - 1) * coeff_count, coeff_mod_count, encrypted_copy.get());
+        // CRT-compose the noise
+        context_data.rns_tool()->base_q()->compose_array(noise_poly, coeff_count, pool_);
 
-        // Now do the dot product of encrypted_copy and the secret key array using NTT. The secret key powers are already NTT transformed.
-        Pointer copy_operand1(allocate_uint(coeff_count, pool));
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            // Initialize pointers for multiplication
-            const uint64_t *current_array1 = encrypted.data(1) + (i * coeff_count);
-            const uint64_t *current_array2 = secret_key_array_.get() + (i * coeff_count);
+        // Next we compute the infinity norm mod parms.coeff_modulus()
+        StrideIter<const uint64_t *> wide_noise_poly((*noise_poly).ptr(), coeff_modulus_size);
+        poly_infty_norm_coeffmod(wide_noise_poly, coeff_count, context_data.total_coeff_modulus(), norm.get(), pool_);
 
-            for (int j = 0; j < encrypted_size - 1; j++)
-            {
-                // Perform the dyadic product. 
-                set_uint_uint(current_array1, coeff_count, copy_operand1.get());
-
-                // Lazy reduction
-                ntt_negacyclic_harvey_lazy(copy_operand1.get(), small_ntt_tables_[i]);
-
-                dyadic_product_coeffmod(copy_operand1.get(), current_array2, coeff_count, small_ntt_tables_[i].modulus(), copy_operand1.get());
-                add_poly_poly_coeffmod(noise_poly.get() + (i * coeff_count), copy_operand1.get(), coeff_count, small_ntt_tables_[i].modulus(),
-                    noise_poly.get() + (i * coeff_count));
-
-                current_array1 += array_poly_uint64_count;
-                current_array2 += array_poly_uint64_count;
-            }
-
-            // Perform inverse NTT
-            inverse_ntt_negacyclic_harvey(noise_poly.get() + (i * coeff_count), small_ntt_tables_[i]);
-        }
-
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            // add c_0 into noise_poly
-            add_poly_poly_coeffmod(noise_poly.get() + (i * coeff_count), encrypted.data() + (i * coeff_count),
-                coeff_count, parms_.coeff_modulus()[i], noise_poly.get() + (i * coeff_count));
-
-            // Multiply by parms_.plain_modulus() and reduce mod parms_.coeff_modulus() to get parms_.coeff_modulus()*noise
-            multiply_poly_scalar_coeffmod(noise_poly.get() + (i * coeff_count), coeff_count,
-                parms_.plain_modulus().value(), parms_.coeff_modulus()[i], noise_poly.get() + (i * coeff_count));
-        }
-
-        // Compose the noise
-        compose(noise_poly.get());
-        
-        // Next we compute the infinity norm mod parms_.coeff_modulus()
-        poly_infty_norm_coeffmod(noise_poly.get(), coeff_count, coeff_mod_count, mod_, destination.get(), pool);
-
-        // The -1 accounts for scaling the invariant noise by 2 
-        return max(0, mod_.significant_bit_count() - get_significant_bit_count_uint(destination.get(), coeff_mod_count) - 1);
+        // The -1 accounts for scaling the invariant noise by 2;
+        // note that we already took plain_modulus into account in compose
+        // so no need to subtract log(plain_modulus) from this
+        int bit_count_diff = context_data.total_coeff_modulus_bit_count() -
+                             get_significant_bit_count_uint(norm.get(), coeff_modulus_size) - 1;
+        return max(0, bit_count_diff);
     }
-}
+} // namespace seal

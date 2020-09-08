@@ -1,8 +1,11 @@
-#include "biguint.h"
-#include "common.h"
-#include "uintcore.h"
-#include "uintarith.h"
-#include "uintarithmod.h"
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
+#include "seal/biguint.h"
+#include "seal/util/common.h"
+#include "seal/util/uintarith.h"
+#include "seal/util/uintarithmod.h"
+#include "seal/util/uintcore.h"
 #include <algorithm>
 
 using namespace std;
@@ -17,21 +20,20 @@ namespace seal
 
     BigUInt::BigUInt(const string &hex_value)
     {
-        operator =(hex_value);
+        operator=(hex_value);
     }
 
     BigUInt::BigUInt(int bit_count, const string &hex_value)
     {
         resize(bit_count);
-        operator =(hex_value);
+        operator=(hex_value);
         if (bit_count != bit_count_)
         {
             resize(bit_count);
         }
     }
 
-    BigUInt::BigUInt(int bit_count, uint64_t *value) :
-        value_(value, true), bit_count_(bit_count)
+    BigUInt::BigUInt(int bit_count, uint64_t *value) : value_(decltype(value_)::Aliasing(value)), bit_count_(bit_count)
     {
         if (bit_count < 0)
         {
@@ -41,22 +43,22 @@ namespace seal
         {
             throw invalid_argument("value must be non-null for non-zero bit count");
         }
-    } 
+    }
 #ifdef SEAL_USE_MSGSL
     BigUInt::BigUInt(gsl::span<uint64_t> value)
     {
-        if(value.size() > numeric_limits<int>::max() / bits_per_uint64)
+        if (unsigned_gt(value.size(), numeric_limits<int>::max() / bits_per_uint64))
         {
-            throw std::invalid_argument("value has too large size");
+            throw invalid_argument("value has too large size");
         }
-        value_ = Pointer(value.data(), true);
+        value_ = decltype(value_)::Aliasing(value.data());
         bit_count_ = static_cast<int>(value.size()) * bits_per_uint64;
     }
 #endif
     BigUInt::BigUInt(int bit_count, uint64_t value)
     {
         resize(bit_count);
-        operator =(value);
+        operator=(value);
         if (bit_count != bit_count_)
         {
             resize(bit_count);
@@ -66,33 +68,29 @@ namespace seal
     BigUInt::BigUInt(const BigUInt &copy)
     {
         resize(copy.bit_count());
-        operator =(copy);
+        operator=(copy);
     }
 
-    BigUInt::BigUInt(BigUInt &&source) noexcept :
-        pool_(move(source.pool_)),
-        value_(move(source.value_)),
-        bit_count_(source.bit_count_)
+    BigUInt::BigUInt(BigUInt &&source) noexcept
+        : pool_(move(source.pool_)), value_(move(source.value_)), bit_count_(source.bit_count_)
     {
         // Pointer in source has been taken over so set it to nullptr
         source.bit_count_ = 0;
     }
 
-    BigUInt::~BigUInt()
+    BigUInt::~BigUInt() noexcept
     {
         reset();
     }
 
     string BigUInt::to_string() const
     {
-        int uint64_count = divide_round_up(bit_count_, bits_per_uint64);
-        return uint_to_hex_string(value_.get(), uint64_count);
+        return uint_to_hex_string(value_.get(), uint64_count());
     }
 
     string BigUInt::to_dec_string() const
     {
-        int uint64_count = divide_round_up(bit_count_, bits_per_uint64);
-        return uint_to_dec_string(value_.get(), uint64_count, pool_);
+        return uint_to_dec_string(value_.get(), uint64_count(), pool_);
     }
 
     void BigUInt::resize(int bit_count)
@@ -113,12 +111,12 @@ namespace seal
         // Lazy initialization of MemoryPoolHandle
         if (!pool_)
         {
-            pool_ = MemoryPoolHandle::Global();
+            pool_ = MemoryManager::GetPool();
         }
 
         // Fast path if allocation size doesn't change.
-        int old_uint64_count = divide_round_up(bit_count_, bits_per_uint64);
-        int new_uint64_count = divide_round_up(bit_count, bits_per_uint64);
+        size_t old_uint64_count = uint64_count();
+        size_t new_uint64_count = safe_cast<size_t>(divide_round_up(bit_count, bits_per_uint64));
         if (old_uint64_count == new_uint64_count)
         {
             bit_count_ = bit_count;
@@ -126,16 +124,16 @@ namespace seal
         }
 
         // Allocate new space.
-        Pointer new_value;
+        decltype(value_) new_value;
         if (new_uint64_count > 0)
         {
-            new_value.swap_with(allocate_uint(new_uint64_count, pool_));
+            new_value = allocate_uint(new_uint64_count, pool_);
         }
 
         // Copy over old value.
         if (new_uint64_count > 0)
         {
-            set_uint_uint(value_.get(), old_uint64_count, new_uint64_count, new_value.get());
+            set_uint(value_.get(), old_uint64_count, new_uint64_count, new_value.get());
             filter_highbits_uint(new_value.get(), new_uint64_count, bit_count);
         }
 
@@ -143,11 +141,11 @@ namespace seal
         reset();
 
         // Update class.
-        value_.swap_with(new_value);
+        swap(value_, new_value);
         bit_count_ = bit_count;
     }
 
-    BigUInt &BigUInt::operator =(const BigUInt& assign)
+    BigUInt &BigUInt::operator=(const BigUInt &assign)
     {
         // Do nothing if same thing.
         if (&assign == this)
@@ -164,22 +162,17 @@ namespace seal
         }
 
         // Copy over value.
-        int assign_uint64_count = divide_round_up(assign_sig_bit_count, bits_per_uint64);
-        int uint64_count = divide_round_up(bit_count_, bits_per_uint64);
-        if (uint64_count > 0)
+        size_t assign_uint64_count = safe_cast<size_t>(divide_round_up(assign_sig_bit_count, bits_per_uint64));
+        if (uint64_count() > 0)
         {
-            set_uint_uint(assign.value_.get(), assign_uint64_count, uint64_count, value_.get());
+            set_uint(assign.value_.get(), assign_uint64_count, uint64_count(), value_.get());
         }
         return *this;
     }
 
-    BigUInt &BigUInt::operator =(const string &hex_value)
+    BigUInt &BigUInt::operator=(const string &hex_value)
     {
-        if (hex_value.size() > numeric_limits<int>::max())
-        {
-            throw invalid_argument("hex_value is too long");
-        }
-        int hex_value_length = static_cast<int>(hex_value.size());
+        int hex_value_length = safe_cast<int>(hex_value.size());
 
         int assign_bit_count = get_hex_string_bit_count(hex_value.data(), hex_value_length);
         if (assign_bit_count > bit_count_)
@@ -190,13 +183,12 @@ namespace seal
         if (bit_count_ > 0)
         {
             // Copy over value.
-            int uint64_count = divide_round_up(bit_count_, bits_per_uint64);
-            hex_string_to_uint(hex_value.data(), hex_value_length, uint64_count, value_.get());
+            hex_string_to_uint(hex_value.data(), hex_value_length, uint64_count(), value_.get());
         }
         return *this;
     }
 
-    BigUInt BigUInt::operator /(const BigUInt& operand2) const
+    BigUInt BigUInt::operator/(const BigUInt &operand2) const
     {
         int result_bits = significant_bit_count();
         int operand2_bits = operand2.significant_bit_count();
@@ -211,21 +203,22 @@ namespace seal
         }
         BigUInt result(result_bits);
         BigUInt remainder(result_bits);
-        int uint64_count = divide_round_up(result_bits, bits_per_uint64);
-        if (uint64_count > operand2.uint64_count())
+        size_t result_uint64_count = result.uint64_count();
+        if (result_uint64_count > operand2.uint64_count())
         {
             BigUInt operand2resized(result_bits);
             operand2resized = operand2;
-            divide_uint_uint(value_.get(), operand2resized.data(), uint64_count, result.data(), remainder.data(), pool_);
+            divide_uint(
+                value_.get(), operand2resized.data(), result_uint64_count, result.data(), remainder.data(), pool_);
         }
         else
         {
-            divide_uint_uint(value_.get(), operand2.data(), uint64_count, result.data(), remainder.data(), pool_);
+            divide_uint(value_.get(), operand2.data(), result_uint64_count, result.data(), remainder.data(), pool_);
         }
         return result;
     }
 
-    BigUInt BigUInt::divrem(const BigUInt& operand2, BigUInt &remainder) const
+    BigUInt BigUInt::divrem(const BigUInt &operand2, BigUInt &remainder) const
     {
         int result_bits = significant_bit_count();
         remainder = *this;
@@ -236,45 +229,88 @@ namespace seal
             return zero;
         }
         BigUInt quotient(result_bits);
-        int uint64_count = remainder.uint64_count();
+        size_t uint64_count = remainder.uint64_count();
         if (uint64_count > operand2.uint64_count())
         {
             BigUInt operand2resized(result_bits);
             operand2resized = operand2;
-            divide_uint_uint_inplace(remainder.data(), operand2resized.data(), uint64_count, quotient.data(), pool_);
+            divide_uint_inplace(remainder.data(), operand2resized.data(), uint64_count, quotient.data(), pool_);
         }
         else
         {
-            divide_uint_uint_inplace(remainder.data(), operand2.data(), uint64_count, quotient.data(), pool_);
+            divide_uint_inplace(remainder.data(), operand2.data(), uint64_count, quotient.data(), pool_);
         }
         return quotient;
     }
 
-    void BigUInt::save(ostream &stream) const
+    void BigUInt::save_members(ostream &stream) const
     {
-        int32_t bit_count32 = static_cast<int32_t>(bit_count_);
-        stream.write(reinterpret_cast<const char*>(&bit_count32), sizeof(int32_t));
-        int uint64_count = divide_round_up(bit_count_, bits_per_uint64);
-        stream.write(reinterpret_cast<const char*>(value_.get()), uint64_count * bytes_per_uint64);
+        auto old_except_mask = stream.exceptions();
+        try
+        {
+            // Throw exceptions on std::ios_base::badbit and std::ios_base::failbit
+            stream.exceptions(ios_base::badbit | ios_base::failbit);
+
+            int32_t bit_count32 = safe_cast<int32_t>(bit_count_);
+            streamsize data_size = safe_cast<streamsize>(mul_safe(uint64_count(), sizeof(uint64_t)));
+            stream.write(reinterpret_cast<const char *>(&bit_count32), sizeof(int32_t));
+            if (data_size)
+            {
+                stream.write(reinterpret_cast<const char *>(value_.get()), data_size);
+            }
+        }
+        catch (const ios_base::failure &)
+        {
+            stream.exceptions(old_except_mask);
+            throw runtime_error("I/O error");
+        }
+        catch (...)
+        {
+            stream.exceptions(old_except_mask);
+            throw;
+        }
+        stream.exceptions(old_except_mask);
     }
 
-    void BigUInt::load(istream &stream)
+    void BigUInt::load_members(istream &stream)
     {
-        int32_t read_bit_count = 0;
-        stream.read(reinterpret_cast<char*>(&read_bit_count), sizeof(int32_t));
-        if (read_bit_count > bit_count_)
+        auto old_except_mask = stream.exceptions();
+        try
         {
-            // Size is too large to currently fit, so resize.
-            resize(read_bit_count);
-        }
-        int read_uint64_count = divide_round_up(read_bit_count, bits_per_uint64);
-        stream.read(reinterpret_cast<char*>(value_.get()), read_uint64_count * bytes_per_uint64);
+            // Throw exceptions on std::ios_base::badbit and std::ios_base::failbit
+            stream.exceptions(ios_base::badbit | ios_base::failbit);
 
-        // Zero any extra space.
-        int uint64_count = divide_round_up(bit_count_, bits_per_uint64);
-        if (uint64_count > read_uint64_count)
-        {
-            set_zero_uint(uint64_count - read_uint64_count, value_.get() + read_uint64_count);
+            int32_t read_bit_count = 0;
+            stream.read(reinterpret_cast<char *>(&read_bit_count), sizeof(int32_t));
+            if (read_bit_count > bit_count_)
+            {
+                // Size is too large to currently fit, so resize.
+                resize(read_bit_count);
+            }
+
+            size_t read_uint64_count = safe_cast<size_t>(divide_round_up(read_bit_count, bits_per_uint64));
+            streamsize data_size = safe_cast<streamsize>(mul_safe(read_uint64_count, sizeof(uint64_t)));
+            if (data_size)
+            {
+                stream.read(reinterpret_cast<char *>(value_.get()), data_size);
+            }
+
+            // Zero any extra space.
+            if (uint64_count() > read_uint64_count)
+            {
+                set_zero_uint(uint64_count() - read_uint64_count, value_.get() + read_uint64_count);
+            }
         }
+        catch (const ios_base::failure &)
+        {
+            stream.exceptions(old_except_mask);
+            throw runtime_error("I/O error");
+        }
+        catch (...)
+        {
+            stream.exceptions(old_except_mask);
+            throw;
+        }
+        stream.exceptions(old_except_mask);
     }
-}
+} // namespace seal

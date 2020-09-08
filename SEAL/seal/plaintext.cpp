@@ -1,10 +1,8 @@
-#include "plaintext.h"
-#include "common.h"
-#include "uintcore.h"
-#include "uintarith.h"
-#include <stdexcept>
-#include <limits>
-#include <algorithm>
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
+#include "seal/plaintext.h"
+#include "seal/util/common.h"
 
 using namespace std;
 using namespace seal::util;
@@ -88,163 +86,26 @@ namespace seal
             }
             return 3;
         }
-    }
+    } // namespace
 
-    void Plaintext::resize(int coeff_count, const MemoryPoolHandle &pool)
+    Plaintext &Plaintext::operator=(const string &hex_poly)
     {
-        if (coeff_count < 0)
+        if (is_ntt_form())
         {
-            throw invalid_argument("coeff_count cannot be negative");
+            throw logic_error("cannot set an NTT transformed Plaintext");
         }
-        if (!pool && !is_alias())
-        {
-            throw invalid_argument("pool is uninitialized");
-        }
-        if (is_alias() && pool != pool_)
-        {
-            throw invalid_argument("cannot resize aliased Plaintext to different memory pool");
-        }
-        if (is_alias() && coeff_count > capacity_)
-        {
-            throw logic_error("cannot resize aliased Plaintext");
-        }
-
-        // If is_alias() we will always hit this
-        if (coeff_count <= capacity_)
-        {
-            // Are we changing size to bigger within current capacity?
-            // If so, need to set top coefficients to zero
-            if (coeff_count > coeff_count_)
-            {
-                set_zero_uint(coeff_count - coeff_count_, plaintext_poly_.get() + coeff_count_);
-            }
-
-            // Set the coeff_count
-            coeff_count_ = coeff_count;
-
-            // Are the pools different? Never if is_alias()
-            if (pool != pool_)
-            {
-                Pointer new_allocation(allocate_uint(capacity_, pool));
-                set_uint_uint(plaintext_poly_.get(), coeff_count_, new_allocation.get());
-                plaintext_poly_.acquire(new_allocation);
-
-                // Finally set new pool
-                // Note that this has to be done last to keep pool_ alive
-                pool_ = pool;
-            }
-            return;
-        }
-
-        // At this point we are guaranteed to not be alias and we know for sure
-        // that capacity_ < coeff_count so need to reallocate to bigger
-        Pointer new_allocation(allocate_uint(coeff_count, pool));
-        set_uint_uint(plaintext_poly_.get(), coeff_count_, new_allocation.get());
-        set_zero_uint(coeff_count - coeff_count_, new_allocation.get() + coeff_count_);
-        plaintext_poly_.acquire(new_allocation);
-
-        // Set the coeff_count and capacity
-        capacity_ = coeff_count;
-        coeff_count_ = coeff_count;
-
-        // Finally set new pool if needed
-        // Note that this has to be done last to keep pool_ alive
-        if (pool_ != pool)
-        {
-            pool_ = pool;
-        }
-    }
-
-    void Plaintext::unalias(const MemoryPoolHandle &pool)
-    {
-        if (!is_alias())
-        {
-            throw logic_error("Plaintext is not an alias");
-        }
-        if (!pool)
-        {
-            throw invalid_argument("pool is uninitialized");
-        }
-
-        // Create new allocation and copy over value
-        Pointer new_allocation(allocate_uint(capacity_, pool));
-        set_uint_uint(plaintext_poly_.get(), coeff_count_, new_allocation.get());
-        plaintext_poly_.acquire(new_allocation);
-
-        // Finally set new pool if necessary
-        // Note that this has to be done last to keep pool_ alive
-        if (pool_ != pool)
-        {
-            pool_ = pool;
-        }
-    }
-
-    void Plaintext::reserve(int capacity, const MemoryPoolHandle &pool)
-    {
-        if (is_alias())
-        {
-            throw logic_error("cannot reserve for aliased Plaintext");
-        }
-        if (!pool)
-        {
-            throw invalid_argument("pool is uninitialized");
-        }
-        if (capacity < 0)
-        {
-            throw invalid_argument("capacity cannot be negative");
-        }
-
-        int copy_coeff_count = min(capacity, coeff_count_);
-
-        // Create new allocation and copy over value
-        Pointer new_allocation(allocate_uint(capacity, pool));
-        set_uint_uint(plaintext_poly_.get(), copy_coeff_count, new_allocation.get());
-        plaintext_poly_.acquire(new_allocation);
-
-        // Set the coeff_count and capacity
-        capacity_ = capacity;
-        coeff_count_ = copy_coeff_count;
-
-        // Finally set new pool if necessary
-        // Note that this has to be done last to keep pool_ alive
-        if (pool_ != pool)
-        {
-            pool_ = pool;
-        }
-    }
-
-    Plaintext &Plaintext::operator =(const BigPoly &poly)
-    {
-        if (poly.coeff_uint64_count() > 1)
-        {
-            throw invalid_argument("poly coefficients are too large");
-        }
-
-        int new_coeff_count = poly.coeff_count();
-
-        // We do this to deal with the case where poly has empty coefficients
-        int new_uint64_count = new_coeff_count * poly.coeff_uint64_count();
-
-        // Resize and set value
-        resize(new_uint64_count);
-        set_uint_uint(poly.data(), new_uint64_count, plaintext_poly_.get());
-
-        return *this;
-    }
-
-    Plaintext &Plaintext::operator =(const string &hex_poly)
-    {
-        if (hex_poly.size() > numeric_limits<int>::max())
+        if (unsigned_gt(hex_poly.size(), numeric_limits<int>::max()))
         {
             throw invalid_argument("hex_poly too long");
         }
-        int length = static_cast<int>(hex_poly.size());
+        int length = safe_cast<int>(hex_poly.size());
 
         // Determine size needed to store string coefficient.
         int assign_coeff_count = 0;
+
         int assign_coeff_bit_count = 0;
         int pos = 0;
-        int last_power = numeric_limits<int>::max();
+        int last_power = safe_cast<int>(min(data_.max_size(), safe_cast<size_t>(numeric_limits<int>::max())));
         const char *hex_poly_ptr = hex_poly.data();
         while (pos < length)
         {
@@ -293,19 +154,16 @@ namespace seal
             return *this;
         }
 
-        // Resize polynomial if needed.
+        // Resize polynomial.
         if (assign_coeff_bit_count > bits_per_uint64)
         {
             throw invalid_argument("hex_poly has too large coefficients");
         }
-        if (coeff_count_ < assign_coeff_count)
-        {
-            resize(max(assign_coeff_count, coeff_count_));
-        }
+        resize(safe_cast<size_t>(assign_coeff_count));
 
         // Populate polynomial from string.
         pos = 0;
-        last_power = coeff_count_;
+        last_power = safe_cast<int>(coeff_count());
         while (pos < length)
         {
             // Determine length of coefficient starting at pos.
@@ -325,40 +183,125 @@ namespace seal
             // Zero coefficients not set by string.
             for (int zero_power = last_power - 1; zero_power > power; --zero_power)
             {
-                plaintext_poly_[zero_power] = 0;
+                data_[static_cast<size_t>(zero_power)] = 0;
             }
 
             // Populate coefficient.
-            uint64_t *coeff_ptr = plaintext_poly_.get() + power;
-            hex_string_to_uint(coeff_start, coeff_length, 1, coeff_ptr);
+            uint64_t *coeff_ptr = data_.begin() + power;
+            hex_string_to_uint(coeff_start, coeff_length, size_t(1), coeff_ptr);
             last_power = power;
         }
 
         // Zero coefficients not set by string.
         for (int zero_power = last_power - 1; zero_power >= 0; --zero_power)
         {
-            plaintext_poly_[zero_power] = 0;
+            data_[static_cast<size_t>(zero_power)] = 0;
         }
 
         return *this;
     }
 
-    void Plaintext::save(ostream &stream) const
+    void Plaintext::save_members(ostream &stream) const
     {
-        int32_t coeff_count32 = static_cast<int32_t>(coeff_count_);
-        stream.write(reinterpret_cast<const char*>(&coeff_count32), sizeof(int32_t));
-        stream.write(reinterpret_cast<const char*>(plaintext_poly_.get()), coeff_count_ * bytes_per_uint64);
+        auto old_except_mask = stream.exceptions();
+        try
+        {
+            // Throw exceptions on std::ios_base::badbit and std::ios_base::failbit
+            stream.exceptions(ios_base::badbit | ios_base::failbit);
+
+            stream.write(reinterpret_cast<const char *>(&parms_id_), sizeof(parms_id_type));
+            uint64_t coeff_count64 = static_cast<uint64_t>(coeff_count_);
+            stream.write(reinterpret_cast<const char *>(&coeff_count64), sizeof(uint64_t));
+            stream.write(reinterpret_cast<const char *>(&scale_), sizeof(double));
+            data_.save(stream, compr_mode_type::none);
+        }
+        catch (const ios_base::failure &)
+        {
+            stream.exceptions(old_except_mask);
+            throw runtime_error("I/O error");
+        }
+        catch (...)
+        {
+            stream.exceptions(old_except_mask);
+            throw;
+        }
+        stream.exceptions(old_except_mask);
     }
 
-    void Plaintext::load(istream &stream)
+    void Plaintext::load_members(shared_ptr<SEALContext> context, istream &stream)
     {
-        int32_t read_coeff_count = 0;
-        stream.read(reinterpret_cast<char*>(&read_coeff_count), sizeof(int32_t));
+        // Verify parameters
+        if (!context)
+        {
+            throw invalid_argument("invalid context");
+        }
+        if (!context->parameters_set())
+        {
+            throw invalid_argument("encryption parameters are not set correctly");
+        }
 
-        // Set new size
-        resize(read_coeff_count);
-        
-        // Read data
-        stream.read(reinterpret_cast<char*>(plaintext_poly_.get()), read_coeff_count * bytes_per_uint64);
+        Plaintext new_data(data_.pool());
+
+        auto old_except_mask = stream.exceptions();
+        try
+        {
+            // Throw exceptions on std::ios_base::badbit and std::ios_base::failbit
+            stream.exceptions(ios_base::badbit | ios_base::failbit);
+
+            parms_id_type parms_id{};
+            stream.read(reinterpret_cast<char *>(&parms_id), sizeof(parms_id_type));
+
+            uint64_t coeff_count64 = 0;
+            stream.read(reinterpret_cast<char *>(&coeff_count64), sizeof(uint64_t));
+
+            double scale = 0;
+            stream.read(reinterpret_cast<char *>(&scale), sizeof(double));
+
+            // Set the metadata
+            new_data.parms_id_ = parms_id;
+            new_data.coeff_count_ = safe_cast<size_t>(coeff_count64);
+            new_data.scale_ = scale;
+
+            // Checking the validity of loaded metadata
+            // Note: We allow pure key levels here! This is to allow load_members
+            // to be used also when loading derived objects like SecretKey. This
+            // further means that functions reading in Plaintext objects must check
+            // that for those use-cases the Plaintext truly is at the data level
+            // if it is supposed to be. In other words, one cannot assume simply
+            // based on load_members succeeding that the Plaintext is valid for
+            // computations.
+            if (!is_metadata_valid_for(new_data, context, true))
+            {
+                throw logic_error("plaintext data is invalid");
+            }
+
+            // Reserve memory now that the metadata is checked for validity.
+            new_data.data_.reserve(new_data.coeff_count_);
+
+            // Load the data. Note that we are supplying also the expected maximum
+            // size of the loaded IntArray. This is an important security measure to
+            // prevent a malformed IntArray from causing arbitrarily large memory
+            // allocations.
+            new_data.data_.load(stream, new_data.coeff_count_);
+
+            // Verify that the buffer is correct
+            if (!is_buffer_valid(new_data))
+            {
+                throw logic_error("plaintext data is invalid");
+            }
+        }
+        catch (const ios_base::failure &)
+        {
+            stream.exceptions(old_except_mask);
+            throw runtime_error("I/O error");
+        }
+        catch (...)
+        {
+            stream.exceptions(old_except_mask);
+            throw;
+        }
+        stream.exceptions(old_except_mask);
+
+        swap(*this, new_data);
     }
-}
+} // namespace seal

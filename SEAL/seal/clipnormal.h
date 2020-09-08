@@ -1,7 +1,11 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
 #pragma once
 
-#include <random>
+#include "seal/util/defines.h"
 #include <cmath>
+#include <random>
 
 namespace seal
 {
@@ -10,22 +14,21 @@ namespace seal
         class ClippedNormalDistribution
         {
         public:
-            typedef double result_type;
+            using result_type = double;
 
-            typedef ClippedNormalDistribution param_type;
+            using param_type = ClippedNormalDistribution;
 
-            ClippedNormalDistribution(result_type mean, result_type standard_deviation, 
-                result_type max_deviation);
+            ClippedNormalDistribution(result_type mean, result_type standard_deviation, result_type max_deviation);
 
             template <typename RNG>
-            inline result_type operator()(RNG &engine, const param_type &parm)
+            SEAL_NODISCARD inline result_type operator()(RNG &engine, const param_type &parm) noexcept
             {
                 param(parm);
                 return operator()(engine);
             }
 
             template <typename RNG>
-            inline result_type operator()(RNG &engine)
+            SEAL_NODISCARD inline result_type operator()(RNG &engine) noexcept
             {
                 result_type mean = normal_.mean();
                 while (true)
@@ -39,42 +42,42 @@ namespace seal
                 }
             }
 
-            inline result_type mean() const
+            SEAL_NODISCARD inline result_type mean() const noexcept
             {
                 return normal_.mean();
             }
 
-            inline result_type standard_deviation() const
+            SEAL_NODISCARD inline result_type standard_deviation() const noexcept
             {
                 return normal_.stddev();
             }
 
-            inline result_type max_deviation() const
+            SEAL_NODISCARD inline result_type max_deviation() const noexcept
             {
                 return max_deviation_;
             }
 
-            inline result_type min() const
+            SEAL_NODISCARD inline result_type min() const noexcept
             {
                 return normal_.mean() - max_deviation_;
             }
 
-            inline result_type max() const
+            SEAL_NODISCARD inline result_type max() const noexcept
             {
                 return normal_.mean() + max_deviation_;
             }
 
-            inline param_type param() const
+            SEAL_NODISCARD inline param_type param() const noexcept
             {
                 return *this;
             }
 
-            inline void param(const param_type &parm)
+            inline void param(const param_type &parm) noexcept
             {
                 *this = parm;
             }
 
-            inline void reset()
+            inline void reset() noexcept
             {
                 normal_.reset();
             }
@@ -84,5 +87,5 @@ namespace seal
 
             result_type max_deviation_;
         };
-    }
-}
+    } // namespace util
+} // namespace seal

@@ -1,8 +1,16 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
 #pragma once
 
+#include "seal/memorymanager.h"
+#include "seal/modulus.h"
+#include "seal/util/defines.h"
+#include "seal/util/iterator.h"
+#include "seal/util/pointer.h"
+#include "seal/util/uintarithsmallmod.h"
+#include "seal/util/uintcore.h"
 #include <stdexcept>
-#include "memorypoolhandle.h"
-#include "modulus.h"
 
 namespace seal
 {
@@ -11,208 +19,288 @@ namespace seal
         class NTTTables
         {
         public:
-            NTTTables() = default;
-
-            NTTTables(int coeff_count_power, const Modulus &modulus);
-
-            NTTTables(const NTTTables &copy);
-
-            NTTTables &operator =(const NTTTables &assign);
-            
             NTTTables(NTTTables &&source) = default;
 
-            NTTTables &operator =(NTTTables &&assign) = default;
-
-            inline bool is_generated() const
+            NTTTables(NTTTables &copy)
+                : pool_(copy.pool_), root_(copy.root_), coeff_count_power_(copy.coeff_count_power_),
+                  coeff_count_(copy.coeff_count_), modulus_(copy.modulus_), inv_degree_modulo_(copy.inv_degree_modulo_)
             {
-                return generated_;
+                root_powers_ = allocate<MultiplyUIntModOperand>(coeff_count_, pool_);
+                inv_root_powers_ = allocate<MultiplyUIntModOperand>(coeff_count_, pool_);
+
+                std::copy_n(copy.root_powers_.get(), coeff_count_, root_powers_.get());
+                std::copy_n(copy.inv_root_powers_.get(), coeff_count_, inv_root_powers_.get());
             }
 
-            bool generate(int coeff_count_power, const Modulus &modulus);
+            NTTTables(int coeff_count_power, const Modulus &modulus, MemoryPoolHandle pool = MemoryManager::GetPool());
 
-            void reset();
-
-            inline const std::uint64_t *get_root() const
+            SEAL_NODISCARD inline std::uint64_t get_root() const
             {
-#ifdef SEAL_DEBUG
-                if (!generated_)
-                {
-                    throw std::logic_error("tables are not generated");
-                }
-#endif
-                return root_.get();
+                return root_;
             }
 
-            inline const std::uint64_t *get_from_root_powers(int index) const 
+            SEAL_NODISCARD inline MultiplyUIntModOperand get_from_root_powers(std::size_t index) const
             {
 #ifdef SEAL_DEBUG
                 if (index >= coeff_count_)
                 {
                     throw std::out_of_range("index");
                 }
-                if (!generated_)
-                {
-                    throw std::logic_error("tables are not generated");
-                }
 #endif
-                return root_powers_.get() + index * coeff_uint64_count_;
+                return root_powers_[index];
             }
 
-            inline const std::uint64_t *get_from_scaled_root_powers(int index) const
+            SEAL_NODISCARD inline MultiplyUIntModOperand get_from_inv_root_powers(std::size_t index) const
             {
 #ifdef SEAL_DEBUG
                 if (index >= coeff_count_)
                 {
                     throw std::out_of_range("index");
                 }
-                if (!generated_)
-                {
-                    throw std::logic_error("tables are not generated");
-                }
 #endif
-                return scaled_root_powers_.get() + index * coeff_uint64_count_;
+                return inv_root_powers_[index];
             }
 
-            inline const std::uint64_t *get_from_inv_root_powers(int index) const
+            SEAL_NODISCARD inline const MultiplyUIntModOperand &inv_degree_modulo() const
             {
-#ifdef SEAL_DEBUG
-                if (index >= coeff_count_)
-                {
-                    throw std::out_of_range("index");
-                }
-                if (!generated_)
-                {
-                    throw std::logic_error("tables are not generated");
-                }
-#endif
-                return inv_root_powers_.get() + index * coeff_uint64_count_;
+                return inv_degree_modulo_;
             }
 
-            inline const std::uint64_t *get_from_scaled_inv_root_powers(int index) const
-            {
-#ifdef SEAL_DEBUG
-                if (index >= coeff_count_)
-                {
-                    throw std::out_of_range("index");
-                }
-                if (!generated_)
-                {
-                    throw std::logic_error("tables are not generated");
-                }
-#endif
-                return scaled_inv_root_powers_.get() + index * coeff_uint64_count_;
-            }
-
-            inline const std::uint64_t *get_from_inv_root_powers_div_two(int index) const
-            {
-#ifdef SEAL_DEBUG
-                if (index >= coeff_count_)
-                {
-                    throw std::out_of_range("index");
-                }
-                if (!generated_)
-                {
-                    throw std::logic_error("tables are not generated");
-                }
-#endif
-                return inv_root_powers_div_two_.get() + index * coeff_uint64_count_;
-            }
-
-            inline const std::uint64_t *get_from_scaled_inv_root_powers_div_two(int index) const 
-            {
-#ifdef SEAL_DEBUG
-                if (index >= coeff_count_)
-                {
-                    throw std::out_of_range("index");
-                }
-                if (!generated_)
-                {
-                    throw std::logic_error("tables are not generated");
-                }
-#endif
-                return scaled_inv_root_powers_div_two_.get() + index * coeff_uint64_count_;
-            }
-
-            inline const std::uint64_t *get_inv_degree_modulo() const 
-            {
-#ifdef SEAL_DEBUG
-                if (!generated_)
-                {
-                    throw std::logic_error("tables are not generated");
-                }
-#endif
-                return inv_degree_modulo_.get();
-            }
-
-            inline const Modulus &modulus() const
+            SEAL_NODISCARD inline const Modulus &modulus() const
             {
                 return modulus_;
             }
 
-            inline int coeff_count_power() const
+            SEAL_NODISCARD inline int coeff_count_power() const
             {
                 return coeff_count_power_;
             }
 
-            inline int coeff_count() const
+            SEAL_NODISCARD inline std::size_t coeff_count() const
             {
                 return coeff_count_;
             }
 
-            inline int coeff_uint64_count() const
-            {
-                return coeff_uint64_count_;
-            }
-
         private:
-            // Computed bit-scrambled vector of first 1 << coeff_count_power powers of a primitive root.
-            void ntt_powers_of_primitive_root(std::uint64_t *root, std::uint64_t *destination);
+            NTTTables &operator=(const NTTTables &assign) = delete;
 
-            // Scales the elements of a vector returned by powers_of_primitive_root(...) by word_size/modulus and rounds down.
-            void ntt_scale_powers_of_primitive_root(std::uint64_t *input, std::uint64_t *destination);
+            NTTTables &operator=(NTTTables &&assign) = delete;
 
-            MemoryPoolHandle pool_ = MemoryPoolHandle::Global();
+            void initialize(int coeff_count_power, const Modulus &modulus);
 
-            // Size coeff_uint64_count_ * coeff_count_
-            Pointer root_powers_;
+            // Computed bit-scrambled vector of first 1 << coeff_count_power powers
+            // of a primitive root.
+            void ntt_powers_of_primitive_root(std::uint64_t root, MultiplyUIntModOperand *destination) const;
 
-            // Size coeff_uint64_count_ * coeff_count_
-            Pointer scaled_root_powers_;
+            MemoryPoolHandle pool_;
 
-            // Size coeff_uint64_count_ * coeff_count_
-            Pointer inv_root_powers_div_two_;
-
-            // Size coeff_uint64_count_ * coeff_count_
-            Pointer scaled_inv_root_powers_div_two_;
-
-            bool generated_ = false;
+            std::uint64_t root_ = 0;
 
             int coeff_count_power_ = 0;
 
-            int coeff_count_ = 0;
-
-            int coeff_uint64_count_ = 0;
-
-            // Allocation for modulus, size coeff_uint64_count_
-            Pointer modulus_alloc_;
+            std::size_t coeff_count_ = 0;
 
             Modulus modulus_;
 
-            // Size uint64_count_
-            Pointer root_;
+            MultiplyUIntModOperand inv_degree_modulo_;
 
-            // Size coeff_uint64_count_ * coeff_count_
-            Pointer inv_root_powers_;
+            // Size coeff_count_
+            Pointer<MultiplyUIntModOperand> root_powers_;
 
-            // Size coeff_uint64_count_ * coeff_count_
-            Pointer scaled_inv_root_powers_;
-
-            // Size coeff_uint64_count_
-            Pointer inv_degree_modulo_;
+            // Size coeff_count_
+            Pointer<MultiplyUIntModOperand> inv_root_powers_;
         };
 
-        void ntt_negacyclic_harvey(std::uint64_t *operand, const NTTTables &tables, MemoryPool &pool);
-        
-        void inverse_ntt_negacyclic_harvey(std::uint64_t *operand, const NTTTables &tables, MemoryPool &pool);
-    }
-}
+        /**
+        Allocate and construct an array of NTTTables each with different a modulus.
+
+        @throws std::invalid_argument if modulus is empty, modulus does not support NTT, coeff_count_power is invalid,
+        or pool is uninitialized.
+        */
+        void CreateNTTTables(
+            int coeff_count_power, const std::vector<Modulus> &modulus, Pointer<NTTTables> &tables,
+            MemoryPoolHandle pool);
+
+        void ntt_negacyclic_harvey_lazy(CoeffIter operand, const NTTTables &tables);
+
+        inline void ntt_negacyclic_harvey_lazy(
+            RNSIter operand, std::size_t coeff_modulus_size, ConstNTTTablesIter tables)
+        {
+#ifdef SEAL_DEBUG
+            if (!operand)
+            {
+                throw std::invalid_argument("operand");
+            }
+            if (!tables)
+            {
+                throw std::invalid_argument("tables");
+            }
+#endif
+            SEAL_ITERATE(iter(operand, tables), coeff_modulus_size, [&](auto I) {
+                ntt_negacyclic_harvey_lazy(get<0>(I), get<1>(I));
+            });
+        }
+
+        inline void ntt_negacyclic_harvey_lazy(PolyIter operand, std::size_t size, ConstNTTTablesIter tables)
+        {
+#ifdef SEAL_DEBUG
+            if (!operand)
+            {
+                throw std::invalid_argument("operand");
+            }
+            if (!tables)
+            {
+                throw std::invalid_argument("tables");
+            }
+#endif
+            SEAL_ITERATE(
+                operand, size, [&](auto I) { ntt_negacyclic_harvey_lazy(I, operand.coeff_modulus_size(), tables); });
+        }
+
+        inline void ntt_negacyclic_harvey(CoeffIter operand, const NTTTables &tables)
+        {
+            ntt_negacyclic_harvey_lazy(operand, tables);
+
+            // Finally maybe we need to reduce every coefficient modulo q, but we
+            // know that they are in the range [0, 4q).
+            // Since word size is controlled this is fast.
+            std::uint64_t modulus = tables.modulus().value();
+            std::uint64_t two_times_modulus = modulus * 2;
+            std::size_t n = std::size_t(1) << tables.coeff_count_power();
+
+            SEAL_ITERATE(operand, n, [&](auto &I) {
+                // Note: I must be passed to the lambda by reference.
+                if (I >= two_times_modulus)
+                {
+                    I -= two_times_modulus;
+                }
+                if (I >= modulus)
+                {
+                    I -= modulus;
+                }
+            });
+        }
+
+        inline void ntt_negacyclic_harvey(RNSIter operand, std::size_t coeff_modulus_size, ConstNTTTablesIter tables)
+        {
+#ifdef SEAL_DEBUG
+            if (!operand)
+            {
+                throw std::invalid_argument("operand");
+            }
+            if (!tables)
+            {
+                throw std::invalid_argument("tables");
+            }
+#endif
+            SEAL_ITERATE(iter(operand, tables), coeff_modulus_size, [&](auto I) {
+                ntt_negacyclic_harvey(get<0>(I), get<1>(I));
+            });
+        }
+
+        inline void ntt_negacyclic_harvey(PolyIter operand, std::size_t size, ConstNTTTablesIter tables)
+        {
+#ifdef SEAL_DEBUG
+            if (!operand)
+            {
+                throw std::invalid_argument("operand");
+            }
+            if (!tables)
+            {
+                throw std::invalid_argument("tables");
+            }
+#endif
+            SEAL_ITERATE(
+                operand, size, [&](auto I) { ntt_negacyclic_harvey(I, operand.coeff_modulus_size(), tables); });
+        }
+
+        void inverse_ntt_negacyclic_harvey_lazy(CoeffIter operand, const NTTTables &tables);
+
+        inline void inverse_ntt_negacyclic_harvey_lazy(
+            RNSIter operand, std::size_t coeff_modulus_size, ConstNTTTablesIter tables)
+        {
+#ifdef SEAL_DEBUG
+            if (!operand)
+            {
+                throw std::invalid_argument("operand");
+            }
+            if (!tables)
+            {
+                throw std::invalid_argument("tables");
+            }
+#endif
+            SEAL_ITERATE(iter(operand, tables), coeff_modulus_size, [&](auto I) {
+                inverse_ntt_negacyclic_harvey_lazy(get<0>(I), get<1>(I));
+            });
+        }
+
+        inline void inverse_ntt_negacyclic_harvey_lazy(PolyIter operand, std::size_t size, ConstNTTTablesIter tables)
+        {
+#ifdef SEAL_DEBUG
+            if (!operand)
+            {
+                throw std::invalid_argument("operand");
+            }
+            if (!tables)
+            {
+                throw std::invalid_argument("tables");
+            }
+#endif
+            SEAL_ITERATE(operand, size, [&](auto I) {
+                inverse_ntt_negacyclic_harvey_lazy(I, operand.coeff_modulus_size(), tables);
+            });
+        }
+
+        inline void inverse_ntt_negacyclic_harvey(CoeffIter operand, const NTTTables &tables)
+        {
+            inverse_ntt_negacyclic_harvey_lazy(operand, tables);
+
+            std::uint64_t modulus = tables.modulus().value();
+            std::size_t n = std::size_t(1) << tables.coeff_count_power();
+
+            // Final adjustments; compute a[j] = a[j] * n^{-1} mod q.
+            // We incorporated the final adjustment in the butterfly. Only need to reduce here.
+            SEAL_ITERATE(operand, n, [&](auto &I) {
+                // Note: I must be passed to the lambda by reference.
+                if (I >= modulus)
+                {
+                    I -= modulus;
+                }
+            });
+        }
+
+        inline void inverse_ntt_negacyclic_harvey(
+            RNSIter operand, std::size_t coeff_modulus_size, ConstNTTTablesIter tables)
+        {
+#ifdef SEAL_DEBUG
+            if (!operand)
+            {
+                throw std::invalid_argument("operand");
+            }
+            if (!tables)
+            {
+                throw std::invalid_argument("tables");
+            }
+#endif
+            SEAL_ITERATE(iter(operand, tables), coeff_modulus_size, [&](auto I) {
+                inverse_ntt_negacyclic_harvey(get<0>(I), get<1>(I));
+            });
+        }
+
+        inline void inverse_ntt_negacyclic_harvey(PolyIter operand, std::size_t size, ConstNTTTablesIter tables)
+        {
+#ifdef SEAL_DEBUG
+            if (!operand)
+            {
+                throw std::invalid_argument("operand");
+            }
+            if (!tables)
+            {
+                throw std::invalid_argument("tables");
+            }
+#endif
+            SEAL_ITERATE(
+                operand, size, [&](auto I) { inverse_ntt_negacyclic_harvey(I, operand.coeff_modulus_size(), tables); });
+        }
+    } // namespace util
+} // namespace seal

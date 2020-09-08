@@ -1,296 +1,151 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
+#include "seal/evaluator.h"
+#include "seal/util/common.h"
+#include "seal/util/galois.h"
+#include "seal/util/numth.h"
+#include "seal/util/polyarithsmallmod.h"
+#include "seal/util/polycore.h"
+#include "seal/util/scalingvariant.h"
+#include "seal/util/uintarith.h"
 #include <algorithm>
-#include <stdexcept>
 #include <cmath>
+#include <functional>
 #include <limits>
-#include "evaluator.h"
-#include "common.h"
-#include "uintcore.h"
-#include "uintarith.h"
-#include "uintarithsmallmod.h"
-#include "polycore.h"
-#include "polyarithsmallmod.h"
-#include "polyfftmultsmallmod.h"
 
 using namespace std;
 using namespace seal::util;
 
 namespace seal
 {
-    Evaluator::Evaluator(const SEALContext &context) :
-        parms_(context.parms()), qualifiers_(context.qualifiers()), 
-        base_converter_(context.base_converter_), 
-        coeff_modulus_(context.coeff_modulus()) 
+    namespace
+    {
+        template <typename T, typename S>
+        inline bool are_same_scale(const T &value1, const S &value2) noexcept
+        {
+            return util::are_close<double>(value1.scale(), value2.scale());
+        }
+    } // namespace
+
+    Evaluator::Evaluator(shared_ptr<SEALContext> context) : context_(move(context))
     {
         // Verify parameters
-        if (!qualifiers_.parameters_set)
+        if (!context_)
+        {
+            throw invalid_argument("invalid context");
+        }
+        if (!context_->parameters_set())
         {
             throw invalid_argument("encryption parameters are not set correctly");
         }
-        
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int poly_coeff_uint64_count = parms_.poly_modulus().coeff_uint64_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        bsk_base_mod_count_ = base_converter_.bsk_base_mod_count();
-        
-        // Set SmallNTTTables
-        bsk_small_ntt_tables_.resize(bsk_base_mod_count_);
-        bsk_small_ntt_tables_ = base_converter_.get_bsk_small_ntt_table();
-
-        coeff_small_ntt_tables_.resize(coeff_mod_count);
-        coeff_small_ntt_tables_ = context.small_ntt_tables_;
-
-        // Copy over bsk moduli array
-        bsk_mod_array_ = base_converter_.get_bsk_mod_array();
-
-        // Copy over inverse of coeff moduli products mod each coeff moduli
-        inv_coeff_products_mod_coeff_array_ = base_converter_.get_inv_coeff_mod_coeff_array();
-
-        // Populate coeff products array for compose functions (used in noise budget)
-        coeff_products_array_ = allocate_uint(coeff_mod_count * coeff_mod_count, pool_);
-        Pointer tmp_coeff(allocate_uint(coeff_mod_count, pool_));
-        set_zero_uint(coeff_mod_count * coeff_mod_count, coeff_products_array_.get());
-
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            *(coeff_products_array_.get() + (i * coeff_mod_count)) = 1;
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                if (i != j)
-                {
-                    multiply_uint_uint64(coeff_products_array_.get() + (i * coeff_mod_count), coeff_mod_count, coeff_modulus_[j].value(), coeff_mod_count, tmp_coeff.get());
-                    set_uint_uint(tmp_coeff.get(), coeff_mod_count, coeff_products_array_.get() + (i * coeff_mod_count));
-                }
-            }
-        }
-
-        // Calculate coeff_modulus / plain_modulus.
-        coeff_div_plain_modulus_ = allocate_uint(coeff_mod_count, pool_);
-        ConstPointer wide_plain_modulus(duplicate_uint_if_needed(parms_.plain_modulus().data(), parms_.plain_modulus().uint64_count(), coeff_mod_count, false, pool_));
-        Pointer temp(allocate_uint(coeff_mod_count, pool_));
-        divide_uint_uint(context.total_coeff_modulus().data(), wide_plain_modulus.get(), coeff_mod_count, coeff_div_plain_modulus_.get(), temp.get(), pool_);
-
-        // Calculate (plain_modulus + 1) / 2.
-        plain_upper_half_threshold_ = (parms_.plain_modulus().value() + 1) >> 1;
-
-        // Calculate coeff_modulus - plain_modulus.
-        plain_upper_half_increment_ = allocate_uint(coeff_mod_count, pool_);
-        sub_uint_uint(context.total_coeff_modulus().data(), wide_plain_modulus.get(), coeff_mod_count, plain_upper_half_increment_.get());
-
-        // Calculate coeff_modulus[i] - plain_modulus if enable_fast_plain_lift
-        if (qualifiers_.enable_fast_plain_lift)
-        {
-            plain_upper_half_increment_array_.resize(coeff_mod_count);
-            for (int i = 0; i < coeff_mod_count; i++)
-            {
-                plain_upper_half_increment_array_[i] = coeff_modulus_[i].value() - parms_.plain_modulus().value();
-            }
-        }
-
-        // Calculate upper_half_increment.
-        upper_half_increment_ = allocate_uint(coeff_mod_count, pool_);
-        multiply_truncate_uint_uint(wide_plain_modulus.get(), coeff_div_plain_modulus_.get(), coeff_mod_count, upper_half_increment_.get());
-        sub_uint_uint(context.total_coeff_modulus().data(), upper_half_increment_.get(), coeff_mod_count, upper_half_increment_.get());
-
-        // Decompose coeff_div_plain_modulus and upper_half_increment
-        Pointer temp_reduction(allocate_uint(coeff_mod_count, pool_));
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            temp_reduction[i] = modulo_uint(coeff_div_plain_modulus_.get(), coeff_mod_count, coeff_modulus_[i], pool_);
-        }
-        set_uint_uint(temp_reduction.get(), coeff_mod_count, coeff_div_plain_modulus_.get());
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            temp_reduction[i] = modulo_uint(upper_half_increment_.get(), coeff_mod_count, coeff_modulus_[i], pool_);
-        }
-        set_uint_uint(temp_reduction.get(), coeff_mod_count, upper_half_increment_.get());
-
-        // Calculate coeff_modulus_ / 2.
-        coeff_modulus_div_two_ = allocate_uint(coeff_mod_count, pool_);
-        right_shift_uint(context.total_coeff_modulus().data(), 1, coeff_mod_count, coeff_modulus_div_two_.get());
-
-        // Set the big coeff modulus for noise computation
-        product_modulus_ = allocate_uint(coeff_mod_count, pool_);
-        set_uint_uint(context.total_coeff_modulus().data(), coeff_mod_count, product_modulus_.get());
-
-        // Initialize moduli.
-        mod_ = Modulus(product_modulus_.get(), coeff_mod_count);
-        polymod_ = PolyModulus(parms_.poly_modulus().data(), coeff_count, poly_coeff_uint64_count);
 
         // Calculate map from Zmstar to generator representation
         populate_Zmstar_to_generator();
     }
 
-    Evaluator::Evaluator(const Evaluator &copy) :
-        pool_(copy.pool_), parms_(copy.parms_), qualifiers_(copy.qualifiers_),
-        base_converter_(copy.base_converter_),
-        coeff_small_ntt_tables_(copy.coeff_small_ntt_tables_),
-        bsk_small_ntt_tables_(copy.bsk_small_ntt_tables_),
-        plain_upper_half_threshold_(copy.plain_upper_half_threshold_),
-        plain_upper_half_increment_array_(copy.plain_upper_half_increment_array_),
-        coeff_modulus_(copy.coeff_modulus_),
-        bsk_mod_array_(copy.bsk_mod_array_),
-        inv_coeff_products_mod_coeff_array_(copy.inv_coeff_products_mod_coeff_array_),
-        bsk_base_mod_count_(copy.bsk_base_mod_count_),
-        Zmstar_to_generator_(copy.Zmstar_to_generator_)
-    {
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int poly_coeff_uint64_count = parms_.poly_modulus().coeff_uint64_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-
-        // Allocate memory and copy over values
-        // Calculate upper_half_increment.
-        upper_half_increment_ = allocate_uint(coeff_mod_count, pool_);
-        set_uint_uint(copy.upper_half_increment_.get(), coeff_mod_count, upper_half_increment_.get());
-
-        // Calculate coeff_modulus / plain_modulus.
-        coeff_div_plain_modulus_ = allocate_uint(coeff_mod_count, pool_);
-        set_uint_uint(copy.coeff_div_plain_modulus_.get(), coeff_mod_count, coeff_div_plain_modulus_.get());
-
-        // Calculate coeff_modulus - plain_modulus.
-        plain_upper_half_increment_ = allocate_uint(coeff_mod_count, pool_);
-        set_uint_uint(copy.plain_upper_half_increment_.get(), coeff_mod_count, plain_upper_half_increment_.get());
-
-        // Calculate coeff_modulus_ / 2.
-        coeff_modulus_div_two_ = allocate_uint(coeff_mod_count, pool_);
-        set_uint_uint(copy.coeff_div_plain_modulus_.get(), coeff_mod_count, coeff_div_plain_modulus_.get());
-
-        // Populate coeff products array for compose functions (used in noise budget)
-        coeff_products_array_ = allocate_uint(coeff_mod_count * coeff_mod_count, pool_);
-        set_uint_uint(copy.coeff_products_array_.get(), coeff_mod_count * coeff_mod_count, coeff_products_array_.get());
-
-        // Set the big coeff modulus for noise computation
-        product_modulus_ = allocate_uint(coeff_mod_count, pool_);
-        set_uint_uint(copy.product_modulus_.get(), coeff_mod_count, product_modulus_.get());
-
-        // Initialize moduli.
-        mod_ = Modulus(product_modulus_.get(), coeff_mod_count);
-        polymod_ = PolyModulus(parms_.poly_modulus().data(), coeff_count, poly_coeff_uint64_count);
-    }
-
-    void Evaluator::compose(uint64_t *value, const MemoryPoolHandle &pool)
-    {
-#ifdef SEAL_DEBUG
-        if (value == nullptr)
-        {
-            throw invalid_argument("value cannot be null");
-        }
-        if (!pool)
-        {
-            throw invalid_argument("pool is uninitialized");
-        }
-#endif
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int total_uint64_count = coeff_mod_count * coeff_count;
-
-        Pointer coefficients(allocate_uint(total_uint64_count, pool));
-        uint64_t *coefficients_ptr = coefficients.get();
-
-        // Re-merge the coefficients first
-        for (int i = 0; i < coeff_count; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                coefficients_ptr[(i * coeff_mod_count) + j] = value[(j * coeff_count) + i];
-            }
-        }
-
-        Pointer temp(allocate_uint(coeff_mod_count, pool));
-        set_zero_uint(total_uint64_count, value);
-
-        for (int i = 0; i < coeff_count; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                uint64_t tmp = multiply_uint_uint_mod(coefficients_ptr[j], inv_coeff_products_mod_coeff_array_[j], coeff_modulus_[j]);
-                multiply_uint_uint64(coeff_products_array_.get() + (j * coeff_mod_count), coeff_mod_count, tmp, coeff_mod_count, temp.get());
-                add_uint_uint_mod(temp.get(), value + (i * coeff_mod_count), mod_.get(), coeff_mod_count, value + (i * coeff_mod_count));
-            }
-            set_zero_uint(coeff_mod_count, temp.get());
-            coefficients_ptr += coeff_mod_count;
-        }
-    }
-
     void Evaluator::populate_Zmstar_to_generator()
     {
-        uint64_t n = parms_.poly_modulus().coeff_count() - 1;
+        uint64_t n = static_cast<uint64_t>(context_->first_context_data()->parms().poly_modulus_degree());
         uint64_t m = n << 1;
 
         for (uint64_t i = 0; i < n / 2; i++)
         {
-            uint64_t galois_elt = (exponentiate_uint64(3, i)) & (m - 1);
+            uint64_t galois_elt = exponentiate_uint(3, i) & (m - 1);
             pair<uint64_t, uint64_t> temp_pair1{ i, 0 };
             Zmstar_to_generator_.emplace(galois_elt, temp_pair1);
-            galois_elt = (exponentiate_uint64(3, i) * (m - 1)) & (m - 1);
-            pair<uint64_t, uint64_t> temp_pair2 = { i, 1 };
+            galois_elt = (exponentiate_uint(3, i) * (m - 1)) & (m - 1);
+            pair<uint64_t, uint64_t> temp_pair2{ i, 1 };
             Zmstar_to_generator_.emplace(galois_elt, temp_pair2);
         }
     }
 
-    void Evaluator::negate(Ciphertext &encrypted)
+    void Evaluator::negate_inplace(Ciphertext &encrypted)
     {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int encrypted_size = encrypted.size();
-
         // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
         {
             throw invalid_argument("encrypted is not valid for encryption parameters");
         }
 
+        // Extract encryption parameters.
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t encrypted_size = encrypted.size();
+
         // Negate each poly in the array
-        for (int j = 0; j < encrypted_size; j++)
+        negate_poly_coeffmod(encrypted, encrypted_size, coeff_modulus, encrypted);
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted.is_transparent())
         {
-            for (int i = 0; i < coeff_mod_count; i++)
-            {
-                negate_poly_coeffmod(encrypted.data(j) + (i * coeff_count), 
-                    coeff_count, coeff_modulus_[i], encrypted.data(j) + (i * coeff_count));
-            }
+            throw logic_error("result ciphertext is transparent");
         }
+#endif
     }
 
-    void Evaluator::add(Ciphertext &encrypted1, const Ciphertext &encrypted2)
+    void Evaluator::add_inplace(Ciphertext &encrypted1, const Ciphertext &encrypted2)
     {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int encrypted1_size = encrypted1.size();
-        int encrypted2_size = encrypted2.size();
-        int max_count = max(encrypted1_size, encrypted2_size);
-        int min_count = min(encrypted1_size, encrypted2_size);
-
         // Verify parameters.
-        if (encrypted1.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted1, context_) || !is_buffer_valid(encrypted1))
         {
             throw invalid_argument("encrypted1 is not valid for encryption parameters");
         }
-        if (encrypted2.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted2, context_) || !is_buffer_valid(encrypted2))
         {
             throw invalid_argument("encrypted2 is not valid for encryption parameters");
         }
+        if (encrypted1.parms_id() != encrypted2.parms_id())
+        {
+            throw invalid_argument("encrypted1 and encrypted2 parameter mismatch");
+        }
+        if (encrypted1.is_ntt_form() != encrypted2.is_ntt_form())
+        {
+            throw invalid_argument("NTT form mismatch");
+        }
+        if (!are_same_scale(encrypted1, encrypted2))
+        {
+            throw invalid_argument("scale mismatch");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_->get_context_data(encrypted1.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+        size_t encrypted1_size = encrypted1.size();
+        size_t encrypted2_size = encrypted2.size();
+        size_t max_count = max(encrypted1_size, encrypted2_size);
+        size_t min_count = min(encrypted1_size, encrypted2_size);
+
+        // Size check
+        if (!product_fits_in(max_count, coeff_count))
+        {
+            throw logic_error("invalid parameters");
+        }
 
         // Prepare destination
-        encrypted1.resize(parms_, max_count);
+        encrypted1.resize(context_, context_data.parms_id(), max_count);
 
         // Add ciphertexts
-        for (int j = 0; j < min_count; j++)
-        {
-            for (int i = 0; i < coeff_mod_count; i++)
-            {
-                add_poly_poly_coeffmod(encrypted1.data(j) + (i * coeff_count), 
-                    encrypted2.data(j) + (i * coeff_count), coeff_count, coeff_modulus_[i], 
-                    encrypted1.data(j) + (i * coeff_count));
-            }
-        }
+        add_poly_coeffmod(encrypted1, encrypted2, min_count, coeff_modulus, encrypted1);
 
         // Copy the remainding polys of the array with larger count into encrypted1
         if (encrypted1_size < encrypted2_size)
         {
-            set_poly_poly(encrypted2.data(min_count), coeff_count * (encrypted2_size - encrypted1_size),
-                coeff_mod_count, encrypted1.data(encrypted1_size));
+            set_poly_array(
+                encrypted2.data(min_count), encrypted2_size - encrypted1_size, coeff_count, coeff_modulus_size,
+                encrypted1.data(encrypted1_size));
         }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted1.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
     }
 
     void Evaluator::add_many(const vector<Ciphertext> &encrypteds, Ciphertext &destination)
@@ -299,615 +154,644 @@ namespace seal
         {
             throw invalid_argument("encrypteds cannot be empty");
         }
+        for (size_t i = 0; i < encrypteds.size(); i++)
+        {
+            if (&encrypteds[i] == &destination)
+            {
+                throw invalid_argument("encrypteds must be different from destination");
+            }
+        }
 
         destination = encrypteds[0];
         for (size_t i = 1; i < encrypteds.size(); i++)
         {
-            add(destination, encrypteds[i]);
+            add_inplace(destination, encrypteds[i]);
         }
     }
 
-    void Evaluator::sub(Ciphertext &encrypted1, const Ciphertext &encrypted2)
+    void Evaluator::sub_inplace(Ciphertext &encrypted1, const Ciphertext &encrypted2)
     {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int encrypted1_size = encrypted1.size();
-        int encrypted2_size = encrypted2.size();
-        int max_count = max(encrypted1_size, encrypted2_size);
-        int min_count = min(encrypted1_size, encrypted2_size);
-
         // Verify parameters.
-        if (encrypted1.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted1, context_) || !is_buffer_valid(encrypted1))
         {
             throw invalid_argument("encrypted1 is not valid for encryption parameters");
         }
-        if (encrypted2.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted2, context_) || !is_buffer_valid(encrypted2))
         {
             throw invalid_argument("encrypted2 is not valid for encryption parameters");
         }
+        if (encrypted1.parms_id() != encrypted2.parms_id())
+        {
+            throw invalid_argument("encrypted1 and encrypted2 parameter mismatch");
+        }
+        if (encrypted1.is_ntt_form() != encrypted2.is_ntt_form())
+        {
+            throw invalid_argument("NTT form mismatch");
+        }
+        if (!are_same_scale(encrypted1, encrypted2))
+        {
+            throw invalid_argument("scale mismatch");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_->get_context_data(encrypted1.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t encrypted1_size = encrypted1.size();
+        size_t encrypted2_size = encrypted2.size();
+        size_t max_count = max(encrypted1_size, encrypted2_size);
+        size_t min_count = min(encrypted1_size, encrypted2_size);
+
+        // Size check
+        if (!product_fits_in(max_count, coeff_count))
+        {
+            throw logic_error("invalid parameters");
+        }
 
         // Prepare destination
-        encrypted1.resize(parms_, max_count);
+        encrypted1.resize(context_, context_data.parms_id(), max_count);
 
-        // Subtract polynomials.
-        for (int j = 0; j < min_count; j++)
-        {
-            for (int i = 0; i < coeff_mod_count; i++)
-            {
-                sub_poly_poly_coeffmod(encrypted1.data(j) + (i * coeff_count),
-                    encrypted2.data(j) + (i * coeff_count), coeff_count, coeff_modulus_[i], 
-                    encrypted1.data(j) + (i * coeff_count));
-            }
-        }
+        // Subtract polynomials
+        sub_poly_coeffmod(encrypted1, encrypted2, min_count, coeff_modulus, encrypted1);
 
         // If encrypted2 has larger count, negate remaining entries
         if (encrypted1_size < encrypted2_size)
         {
-            for (int i = 0; i < coeff_mod_count; i++)
-            {
-                negate_poly_coeffmod(encrypted2.data(encrypted1_size) + (i * coeff_count),
-                    coeff_count * (encrypted2_size - encrypted1_size), coeff_modulus_[i],
-                    encrypted1.data(encrypted1_size) + (i * coeff_count));
-            }
+            negate_poly_coeffmod(
+                iter(encrypted2) + min_count, encrypted2_size - min_count, coeff_modulus, iter(encrypted1) + min_count);
         }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted1.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
     }
 
-    void Evaluator::multiply(Ciphertext &encrypted1, const Ciphertext &encrypted2, const MemoryPoolHandle &pool)
+    void Evaluator::multiply_inplace(Ciphertext &encrypted1, const Ciphertext &encrypted2, MemoryPoolHandle pool)
     {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int bsk_mtilde_count = bsk_base_mod_count_ + 1;
-        int encrypted1_size = encrypted1.size();
-        int encrypted2_size = encrypted2.size();
-
         // Verify parameters.
-        if (encrypted1.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted1, context_) || !is_buffer_valid(encrypted1))
         {
             throw invalid_argument("encrypted1 is not valid for encryption parameters");
         }
-        if (encrypted2.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted2, context_) || !is_buffer_valid(encrypted2))
         {
             throw invalid_argument("encrypted2 is not valid for encryption parameters");
         }
-        if (!pool)
+        if (encrypted1.parms_id() != encrypted2.parms_id())
         {
-            throw invalid_argument("pool is uninitialized");
+            throw invalid_argument("encrypted1 and encrypted2 parameter mismatch");
+        }
+
+        auto context_data_ptr = context_->first_context_data();
+        switch (context_data_ptr->parms().scheme())
+        {
+        case scheme_type::BFV:
+            bfv_multiply(encrypted1, encrypted2, pool);
+            break;
+
+        case scheme_type::CKKS:
+            ckks_multiply(encrypted1, encrypted2, pool);
+            break;
+
+        default:
+            throw invalid_argument("unsupported scheme");
+        }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted1.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
+    }
+
+    void Evaluator::bfv_multiply(Ciphertext &encrypted1, const Ciphertext &encrypted2, MemoryPoolHandle pool)
+    {
+        if (encrypted1.is_ntt_form() || encrypted2.is_ntt_form())
+        {
+            throw invalid_argument("encrypted1 or encrypted2 cannot be in NTT form");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_->get_context_data(encrypted1.parms_id());
+        auto &parms = context_data.parms();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t base_q_size = parms.coeff_modulus().size();
+        size_t encrypted1_size = encrypted1.size();
+        size_t encrypted2_size = encrypted2.size();
+
+        uint64_t plain_modulus = parms.plain_modulus().value();
+        auto rns_tool = context_data.rns_tool();
+        size_t base_Bsk_size = rns_tool->base_Bsk()->size();
+        size_t base_Bsk_m_tilde_size = rns_tool->base_Bsk_m_tilde()->size();
+
+        // Determine destination.size()
+        size_t dest_size = sub_safe(add_safe(encrypted1_size, encrypted2_size), size_t(1));
+
+        // Size check
+        if (!product_fits_in(dest_size, coeff_count, base_Bsk_m_tilde_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // Set up iterators for bases
+        auto base_q = iter(parms.coeff_modulus());
+        auto base_Bsk = iter(rns_tool->base_Bsk()->base());
+
+        // Set up iterators for NTT tables
+        auto base_q_ntt_tables = iter(context_data.small_ntt_tables());
+        auto base_Bsk_ntt_tables = iter(rns_tool->base_Bsk_ntt_tables());
+
+        // Microsoft SEAL uses BEHZ-style RNS multiplication. This process is somewhat complex and consists of the
+        // following steps:
+        //
+        // (1) Lift encrypted1 and encrypted2 (initially in base q) to an extended base q U Bsk U {m_tilde}
+        // (2) Remove extra multiples of q from the results with Montgomery reduction, switching base to q U Bsk
+        // (3) Transform the data to NTT form
+        // (4) Compute the ciphertext polynomial product using dyadic multiplication
+        // (5) Transform the data back from NTT form
+        // (6) Multiply the result by t (plain_modulus)
+        // (7) Scale the result by q using a divide-and-floor algorithm, switching base to Bsk
+        // (8) Use Shenoy-Kumaresan method to convert the result to base q
+
+        // Resize encrypted1 to destination size
+        encrypted1.resize(context_, context_data.parms_id(), dest_size);
+
+        // This lambda function takes as input an IterTuple with three components:
+        //
+        // 1. (Const)RNSIter to read an input polynomial from
+        // 2. RNSIter for the output in base q
+        // 3. RNSIter for the output in base Bsk
+        //
+        // It performs steps (1)-(3) of the BEHZ multiplication (see above) on the given input polynomial (given as an
+        // RNSIter or ConstRNSIter) and writes the results in base q and base Bsk to the given output
+        // iterators.
+        auto behz_extend_base_convert_to_ntt = [&](auto I) {
+            // Make copy of input polynomial (in base q) and convert to NTT form
+            // Lazy reduction
+            set_poly(get<0>(I), coeff_count, base_q_size, get<1>(I));
+            ntt_negacyclic_harvey_lazy(get<1>(I), base_q_size, base_q_ntt_tables);
+
+            // Allocate temporary space for a polynomial in the Bsk U {m_tilde} base
+            SEAL_ALLOCATE_GET_RNS_ITER(temp, coeff_count, base_Bsk_m_tilde_size, pool);
+
+            // (1) Convert from base q to base Bsk U {m_tilde}
+            rns_tool->fastbconv_m_tilde(get<0>(I), temp, pool);
+
+            // (2) Reduce q-overflows in with Montgomery reduction, switching base to Bsk
+            rns_tool->sm_mrq(temp, get<2>(I), pool);
+
+            // Transform to NTT form in base Bsk
+            // Lazy reduction
+            ntt_negacyclic_harvey_lazy(get<2>(I), base_Bsk_size, base_Bsk_ntt_tables);
+        };
+
+        // Allocate space for a base q output of behz_extend_base_convert_to_ntt for encrypted1
+        SEAL_ALLOCATE_GET_POLY_ITER(encrypted1_q, encrypted1_size, coeff_count, base_q_size, pool);
+
+        // Allocate space for a base Bsk output of behz_extend_base_convert_to_ntt for encrypted1
+        SEAL_ALLOCATE_GET_POLY_ITER(encrypted1_Bsk, encrypted1_size, coeff_count, base_Bsk_size, pool);
+
+        // Perform BEHZ steps (1)-(3) for encrypted1
+        SEAL_ITERATE(iter(encrypted1, encrypted1_q, encrypted1_Bsk), encrypted1_size, behz_extend_base_convert_to_ntt);
+
+        // Repeat for encrypted2
+        SEAL_ALLOCATE_GET_POLY_ITER(encrypted2_q, encrypted2_size, coeff_count, base_q_size, pool);
+        SEAL_ALLOCATE_GET_POLY_ITER(encrypted2_Bsk, encrypted2_size, coeff_count, base_Bsk_size, pool);
+
+        SEAL_ITERATE(iter(encrypted2, encrypted2_q, encrypted2_Bsk), encrypted2_size, behz_extend_base_convert_to_ntt);
+
+        // Allocate temporary space for the output of step (4)
+        // We allocate space separately for the base q and the base Bsk components
+        SEAL_ALLOCATE_ZERO_GET_POLY_ITER(temp_dest_q, dest_size, coeff_count, base_q_size, pool);
+        SEAL_ALLOCATE_ZERO_GET_POLY_ITER(temp_dest_Bsk, dest_size, coeff_count, base_Bsk_size, pool);
+
+        // Perform BEHZ step (4): dyadic multiplication on arbitrary size ciphertexts
+        SEAL_ITERATE(iter(size_t(0)), dest_size, [&](auto I) {
+            // We iterate over relevant components of encrypted1 and encrypted2 in increasing order for
+            // encrypted1 and reversed (decreasing) order for encrypted2. The bounds for the indices of
+            // the relevant terms are obtained as follows.
+            size_t curr_encrypted1_last = min<size_t>(I, encrypted1_size - 1);
+            size_t curr_encrypted2_first = min<size_t>(I, encrypted2_size - 1);
+            size_t curr_encrypted1_first = I - curr_encrypted2_first;
+            // size_t curr_encrypted2_last = I - curr_encrypted1_last;
+
+            // The total number of dyadic products is now easy to compute
+            size_t steps = curr_encrypted1_last - curr_encrypted1_first + 1;
+
+            // This lambda function computes the ciphertext product for BFV multiplication. Since we use the BEHZ
+            // approach, the multiplication of individual polynomials is done using a dyadic product where the inputs
+            // are already in NTT form. The arguments of the lambda function are expected to be as follows:
+            //
+            // 1. a ConstPolyIter pointing to the beginning of the first input ciphertext (in NTT form)
+            // 2. a ConstPolyIter pointing to the beginning of the second input ciphertext (in NTT form)
+            // 3. a ConstModulusIter pointing to an array of Modulus elements for the base
+            // 4. the size of the base
+            // 5. a PolyIter pointing to the beginning of the output ciphertext
+            auto behz_ciphertext_product = [&](ConstPolyIter in1_iter, ConstPolyIter in2_iter,
+                                               ConstModulusIter base_iter, size_t base_size, PolyIter out_iter) {
+                // Create a shifted iterator for the first input
+                auto shifted_in1_iter = in1_iter + curr_encrypted1_first;
+
+                // Create a shifted reverse iterator for the second input
+                auto shifted_reversed_in2_iter = reverse_iter(in2_iter + curr_encrypted2_first);
+
+                // Create a shifted iterator for the output
+                auto shifted_out_iter = out_iter[I];
+
+                SEAL_ITERATE(iter(shifted_in1_iter, shifted_reversed_in2_iter), steps, [&](auto J) {
+                    SEAL_ITERATE(iter(J, base_iter, shifted_out_iter), base_size, [&](auto K) {
+                        SEAL_ALLOCATE_GET_COEFF_ITER(temp, coeff_count, pool);
+                        dyadic_product_coeffmod(get<0, 0>(K), get<0, 1>(K), coeff_count, get<1>(K), temp);
+                        add_poly_coeffmod(temp, get<2>(K), coeff_count, get<1>(K), get<2>(K));
+                    });
+                });
+            };
+
+            // Perform the BEHZ ciphertext product both for base q and base Bsk
+            behz_ciphertext_product(encrypted1_q, encrypted2_q, base_q, base_q_size, temp_dest_q);
+            behz_ciphertext_product(encrypted1_Bsk, encrypted2_Bsk, base_Bsk, base_Bsk_size, temp_dest_Bsk);
+        });
+
+        // Perform BEHZ step (5): transform data from NTT form
+        // Lazy reduction here. The following multiply_poly_scalar_coeffmod will correct the value back to [0, p)
+        inverse_ntt_negacyclic_harvey_lazy(temp_dest_q, dest_size, base_q_ntt_tables);
+        inverse_ntt_negacyclic_harvey_lazy(temp_dest_Bsk, dest_size, base_Bsk_ntt_tables);
+
+        // Perform BEHZ steps (6)-(8)
+        SEAL_ITERATE(iter(temp_dest_q, temp_dest_Bsk, encrypted1), dest_size, [&](auto I) {
+            // Bring together the base q and base Bsk components into a single allocation
+            SEAL_ALLOCATE_GET_RNS_ITER(temp_q_Bsk, coeff_count, base_q_size + base_Bsk_size, pool);
+
+            // Step (6): multiply base q components by t (plain_modulus)
+            multiply_poly_scalar_coeffmod(get<0>(I), base_q_size, plain_modulus, base_q, temp_q_Bsk);
+
+            multiply_poly_scalar_coeffmod(get<1>(I), base_Bsk_size, plain_modulus, base_Bsk, temp_q_Bsk + base_q_size);
+
+            // Allocate yet another temporary for fast divide-and-floor result in base Bsk
+            SEAL_ALLOCATE_GET_RNS_ITER(temp_Bsk, coeff_count, base_Bsk_size, pool);
+
+            // Step (7): divide by q and floor, producing a result in base Bsk
+            rns_tool->fast_floor(temp_q_Bsk, temp_Bsk, pool);
+
+            // Step (8): use Shenoy-Kumaresan method to convert the result to base q and write to encrypted1
+            rns_tool->fastbconv_sk(temp_Bsk, get<2>(I), pool);
+        });
+    }
+
+    void Evaluator::ckks_multiply(Ciphertext &encrypted1, const Ciphertext &encrypted2, MemoryPoolHandle pool)
+    {
+        if (!(encrypted1.is_ntt_form() && encrypted2.is_ntt_form()))
+        {
+            throw invalid_argument("encrypted1 or encrypted2 must be in NTT form");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_->get_context_data(encrypted1.parms_id());
+        auto &parms = context_data.parms();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = parms.coeff_modulus().size();
+        size_t encrypted1_size = encrypted1.size();
+        size_t encrypted2_size = encrypted2.size();
+
+        double new_scale = encrypted1.scale() * encrypted2.scale();
+
+        // Check that scale is positive and not too large
+        if (new_scale <= 0 || (static_cast<int>(log2(new_scale)) >= context_data.total_coeff_modulus_bit_count()))
+        {
+            throw invalid_argument("scale out of bounds");
         }
 
         // Determine destination.size()
         // Default is 3 (c_0, c_1, c_2)
-        int dest_count = encrypted1_size + encrypted2_size - 1;
+        size_t dest_size = sub_safe(add_safe(encrypted1_size, encrypted2_size), size_t(1));
+
+        // Size check
+        if (!product_fits_in(dest_size, coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // Set up iterator for the base
+        auto coeff_modulus = iter(parms.coeff_modulus());
 
         // Prepare destination
-        encrypted1.resize(parms_, dest_count);
+        encrypted1.resize(context_, context_data.parms_id(), dest_size);
 
-        int encrypted_ptr_increment = coeff_count * coeff_mod_count;
-        int encrypted_bsk_mtilde_ptr_increment = coeff_count * bsk_mtilde_count;
-        int encrypted_bsk_ptr_increment = coeff_count * bsk_base_mod_count_;
+        // Set up iterators for input ciphertexts
+        auto encrypted1_iter = iter(encrypted1);
+        auto encrypted2_iter = iter(encrypted2);
 
-        // Make temp polys for FastBConverter result from q ---> Bsk U {m_tilde}
-        Pointer tmp_encrypted1_bsk_mtilde(allocate_poly(coeff_count * encrypted1_size, bsk_mtilde_count, pool));
-        Pointer tmp_encrypted2_bsk_mtilde(allocate_poly(coeff_count * encrypted2_size, bsk_mtilde_count, pool));
+        // Allocate temporary space for the result
+        SEAL_ALLOCATE_ZERO_GET_POLY_ITER(temp, dest_size, coeff_count, coeff_modulus_size, pool);
 
-        // Make temp polys for FastBConverter result from Bsk U {m_tilde} -----> Bsk
-        Pointer tmp_encrypted1_bsk(allocate_poly(coeff_count * encrypted1_size, bsk_base_mod_count_, pool));
-        Pointer tmp_encrypted2_bsk(allocate_poly(coeff_count * encrypted2_size, bsk_base_mod_count_, pool));
+        SEAL_ITERATE(iter(size_t(0)), dest_size, [&](auto I) {
+            // We iterate over relevant components of encrypted1 and encrypted2 in increasing order for
+            // encrypted1 and reversed (decreasing) order for encrypted2. The bounds for the indices of
+            // the relevant terms are obtained as follows.
+            size_t curr_encrypted1_last = min<size_t>(I, encrypted1_size - 1);
+            size_t curr_encrypted2_first = min<size_t>(I, encrypted2_size - 1);
+            size_t curr_encrypted1_first = I - curr_encrypted2_first;
+            // size_t curr_encrypted2_last = secret_power_index - curr_encrypted1_last;
 
-        // Step 0: fast base convert from q to Bsk U {m_tilde}
-        // Step 1: reduce q-overflows in Bsk
-        // Iterate over all the ciphertexts inside encrypted1
-        for (int i = 0; i < encrypted1_size; i++)
-        {
-            base_converter_.fastbconv_mtilde(encrypted1.data(i), 
-                tmp_encrypted1_bsk_mtilde.get() + (i * encrypted_bsk_mtilde_ptr_increment), pool);
-            base_converter_.mont_rq(tmp_encrypted1_bsk_mtilde.get() + (i * encrypted_bsk_mtilde_ptr_increment), 
-                tmp_encrypted1_bsk.get() + (i * encrypted_bsk_ptr_increment));
-        }
-        
-        // Iterate over all the ciphertexts inside encrypted2
-        for (int i = 0; i < encrypted2_size; i++)
-        {
-            base_converter_.fastbconv_mtilde(encrypted2.data(i), 
-                tmp_encrypted2_bsk_mtilde.get() + (i * encrypted_bsk_mtilde_ptr_increment), pool);
-            base_converter_.mont_rq(tmp_encrypted2_bsk_mtilde.get() + (i * encrypted_bsk_mtilde_ptr_increment), 
-                tmp_encrypted2_bsk.get() + (i * encrypted_bsk_ptr_increment));
-        }
-        
-        // Step 2: compute product and multiply plain modulus to the result
-        // We need to multiply both in q and Bsk. Values in encrypted_safe are in base q and values in tmp_encrypted_bsk are in base Bsk
-        // We iterate over destination poly array and generate each poly based on the indices of inputs (arbitrary sizes for ciphertexts)
-        // First allocate two temp polys: one for results in base q and the other for the result in base Bsk
-        // These need to be zero for the arbitrary size multiplication; not for 2x2 though
-        Pointer tmp_des_coeff_base(allocate_zero_poly(coeff_count * dest_count, coeff_mod_count, pool));
-        Pointer tmp_des_bsk_base(allocate_zero_poly(coeff_count * dest_count, bsk_base_mod_count_, pool));
+            // The total number of dyadic products is now easy to compute
+            size_t steps = curr_encrypted1_last - curr_encrypted1_first + 1;
 
-        // Allocate two tmp polys: one for NTT multiplication results in base q and one for result in base Bsk
-        Pointer tmp1_poly_coeff_base(allocate_poly(coeff_count, coeff_mod_count, pool));
-        Pointer tmp1_poly_bsk_base(allocate_poly(coeff_count, bsk_base_mod_count_, pool));
-        Pointer tmp2_poly_coeff_base(allocate_poly(coeff_count, coeff_mod_count, pool));
-        Pointer tmp2_poly_bsk_base(allocate_poly(coeff_count, bsk_base_mod_count_, pool));
+            // Create a shifted iterator for the first input
+            auto shifted_encrypted1_iter = encrypted1_iter + curr_encrypted1_first;
 
-        int current_encrypted1_limit = 0;
+            // Create a shifted reverse iterator for the second input
+            auto shifted_reversed_encrypted2_iter = reverse_iter(encrypted2_iter + curr_encrypted2_first);
 
-        // First convert all the inputs into NTT form
-        Pointer copy_encrypted1_ntt_coeff_mod(allocate_poly(coeff_count * encrypted1_size, coeff_mod_count, pool));
-        set_poly_poly(encrypted1.data(), coeff_count * encrypted1_size, coeff_mod_count, copy_encrypted1_ntt_coeff_mod.get());
+            SEAL_ITERATE(iter(shifted_encrypted1_iter, shifted_reversed_encrypted2_iter), steps, [&](auto J) {
+                // Extra care needed here:
+                // temp_iter must be dereferenced once to produce an appropriate RNSIter
+                SEAL_ITERATE(iter(J, coeff_modulus, temp[I]), coeff_modulus_size, [&](auto K) {
+                    SEAL_ALLOCATE_GET_COEFF_ITER(prod, coeff_count, pool);
+                    dyadic_product_coeffmod(get<0, 0>(K), get<0, 1>(K), coeff_count, get<1>(K), prod);
+                    add_poly_coeffmod(prod, get<2>(K), coeff_count, get<1>(K), get<2>(K));
+                });
+            });
+        });
 
-        Pointer copy_encrypted1_ntt_bsk_base_mod(allocate_poly(coeff_count * encrypted1_size, bsk_base_mod_count_, pool));
-        set_poly_poly(tmp_encrypted1_bsk.get(), coeff_count * encrypted1_size, bsk_base_mod_count_, copy_encrypted1_ntt_bsk_base_mod.get());
+        // Set the final result
+        set_poly_array(temp, dest_size, coeff_count, coeff_modulus_size, encrypted1.data());
 
-        Pointer copy_encrypted2_ntt_coeff_mod(allocate_poly(coeff_count * encrypted2_size, coeff_mod_count, pool));
-        set_poly_poly(encrypted2.data(), coeff_count * encrypted2_size, coeff_mod_count, copy_encrypted2_ntt_coeff_mod.get());
-
-        Pointer copy_encrypted2_ntt_bsk_base_mod(allocate_poly(coeff_count * encrypted2_size, bsk_base_mod_count_, pool));
-        set_poly_poly(tmp_encrypted2_bsk.get(), coeff_count * encrypted2_size, bsk_base_mod_count_, copy_encrypted2_ntt_bsk_base_mod.get());
-
-        for (int i = 0; i < encrypted1_size; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                // Lazy reduction
-                ntt_negacyclic_harvey_lazy(copy_encrypted1_ntt_coeff_mod.get() + (j * coeff_count) + (i * encrypted_ptr_increment), coeff_small_ntt_tables_[j]);
-            }
-            for (int j = 0; j < bsk_base_mod_count_; j++)
-            {
-                // Lazy reduction
-                ntt_negacyclic_harvey_lazy(copy_encrypted1_ntt_bsk_base_mod.get() + (j * coeff_count) + (i * encrypted_bsk_ptr_increment), bsk_small_ntt_tables_[j]);
-            }
-        }
-
-        for (int i = 0; i < encrypted2_size; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                // Lazy reduction
-                ntt_negacyclic_harvey_lazy(copy_encrypted2_ntt_coeff_mod.get() + (j * coeff_count) + (i * encrypted_ptr_increment), coeff_small_ntt_tables_[j]);
-            }
-            for (int j = 0; j < bsk_base_mod_count_; j++)
-            {
-                // Lazy reduction
-                ntt_negacyclic_harvey_lazy(copy_encrypted2_ntt_bsk_base_mod.get() + (j * coeff_count) + (i * encrypted_bsk_ptr_increment), bsk_small_ntt_tables_[j]);
-            }
-        }
-
-        // Perform Karatsuba multiplication on size 2 ciphertexts
-        if (encrypted1_size == 2 && encrypted2_size == 2)
-        {
-            Pointer tmp_first_mul_coeff_base(allocate_poly(coeff_count, coeff_mod_count, pool));
-
-            // Compute c0 + c1 and c0*d0 in base q
-            uint64_t *temp_ptr_1 = tmp1_poly_coeff_base.get();
-            uint64_t *temp_ptr_2 = copy_encrypted1_ntt_coeff_mod.get();
-            uint64_t *temp_ptr_3 = temp_ptr_2 + encrypted_ptr_increment;
-            for (int i = 0; i < coeff_mod_count; i++)
-            {
-                //add_poly_poly_coeffmod(copy_encrypted1_ntt_coeff_mod.get() + (i * coeff_count), 
-                //    copy_encrypted1_ntt_coeff_mod.get() + (i * coeff_count) + encrypted_ptr_increment, 
-                //    coeff_count, coeff_modulus_[i], tmp1_poly_coeff_base.get() + (i * coeff_count));
-
-                // Lazy reduction
-                for (int j = 0; j < coeff_count; j++)
-                {
-                    *temp_ptr_1++ = *temp_ptr_2++ + *temp_ptr_3++;
-                }
-                dyadic_product_coeffmod(copy_encrypted1_ntt_coeff_mod.get() + (i * coeff_count), 
-                    copy_encrypted2_ntt_coeff_mod.get() + (i * coeff_count), coeff_count, coeff_modulus_[i], 
-                    tmp_first_mul_coeff_base.get() + (i * coeff_count));
-            }
-
-            Pointer tmp_first_mul_bsk_base(allocate_poly(coeff_count, bsk_base_mod_count_, pool));
-
-            // Compute c0 + c1 and c0*d0 in base bsk
-            temp_ptr_1 = tmp1_poly_bsk_base.get();
-            temp_ptr_2 = copy_encrypted1_ntt_bsk_base_mod.get();
-            temp_ptr_3 = temp_ptr_2 + encrypted_bsk_ptr_increment;
-            for (int i = 0; i < bsk_base_mod_count_; i++)
-            {
-                //add_poly_poly_coeffmod(copy_encrypted1_ntt_bsk_base_mod.get() + (i * coeff_count), 
-                //    copy_encrypted1_ntt_bsk_base_mod.get() + (i * coeff_count) + encrypted_bsk_ptr_increment, 
-                //    coeff_count, bsk_mod_array_[i], tmp1_poly_bsk_base.get() + (i * coeff_count));
-                for (int j = 0; j < coeff_count; j++)
-                {
-                    *temp_ptr_1++ = *temp_ptr_2++ + *temp_ptr_3++;
-                }
-                dyadic_product_coeffmod(copy_encrypted1_ntt_bsk_base_mod.get() + (i * coeff_count), 
-                    copy_encrypted2_ntt_bsk_base_mod.get() + (i * coeff_count), coeff_count, bsk_mod_array_[i], 
-                    tmp_first_mul_bsk_base.get() + (i * coeff_count));
-            }
-
-            Pointer tmp_second_mul_coeff_base(allocate_poly(coeff_count, coeff_mod_count, pool));
-
-            // Compute d0 + d1 and c1*d1 in base q
-            temp_ptr_1 = tmp2_poly_coeff_base.get();
-            temp_ptr_2 = copy_encrypted2_ntt_coeff_mod.get();
-            temp_ptr_3 = temp_ptr_2 + encrypted_ptr_increment;
-            for (int i = 0; i < coeff_mod_count; i++)
-            {
-                //add_poly_poly_coeffmod(copy_encrypted2_ntt_coeff_mod.get() + (i * coeff_count), 
-                //    copy_encrypted2_ntt_coeff_mod.get() + (i * coeff_count) + encrypted_ptr_increment, 
-                //    coeff_count, coeff_modulus_[i], tmp2_poly_coeff_base.get() + (i * coeff_count));
-                for (int j = 0; j < coeff_count; j++)
-                {
-                    *temp_ptr_1++ = *temp_ptr_2++ + *temp_ptr_3++;
-                }
-                dyadic_product_coeffmod(copy_encrypted1_ntt_coeff_mod.get() + (i * coeff_count) + encrypted_ptr_increment, 
-                    copy_encrypted2_ntt_coeff_mod.get() + (i * coeff_count) + encrypted_ptr_increment, 
-                    coeff_count, coeff_modulus_[i], tmp_second_mul_coeff_base.get() + (i * coeff_count));
-            }
-
-            Pointer tmp_second_mul_bsk_base(allocate_poly(coeff_count, bsk_base_mod_count_, pool));
-
-            // Compute d0 + d1 and c1*d1 in base bsk
-            temp_ptr_1 = tmp2_poly_bsk_base.get();
-            temp_ptr_2 = copy_encrypted2_ntt_bsk_base_mod.get();
-            temp_ptr_3 = temp_ptr_2 + encrypted_bsk_ptr_increment;
-            for (int i = 0; i < bsk_base_mod_count_; i++)
-            {
-                //add_poly_poly_coeffmod(copy_encrypted2_ntt_bsk_base_mod.get() + (i * coeff_count), 
-                //    copy_encrypted2_ntt_bsk_base_mod.get() + (i * coeff_count) + encrypted_bsk_ptr_increment, 
-                //    coeff_count, bsk_mod_array_[i], tmp2_poly_bsk_base.get() + (i * coeff_count));
-                for (int j = 0; j < coeff_count; j++)
-                {
-                    *temp_ptr_1++ = *temp_ptr_2++ + *temp_ptr_3++;
-                }
-                dyadic_product_coeffmod(copy_encrypted1_ntt_bsk_base_mod.get() + (i * coeff_count) + encrypted_bsk_ptr_increment, 
-                    copy_encrypted2_ntt_bsk_base_mod.get() + (i * coeff_count) + encrypted_bsk_ptr_increment, 
-                    coeff_count, bsk_mod_array_[i], tmp_second_mul_bsk_base.get() + (i * coeff_count));
-            }
-
-            Pointer tmp_mul_poly_coeff_base(allocate_poly(coeff_count, coeff_mod_count, pool));
-            Pointer tmp_mul_poly_bsk_base(allocate_poly(coeff_count, bsk_base_mod_count_, pool));
-
-            // Set destination first and third polys in base q
-            // Des[0] in base q
-            set_poly_poly(tmp_first_mul_coeff_base.get(), coeff_count, coeff_mod_count, tmp_des_coeff_base.get());
-
-            // Des[2] in base q
-            set_poly_poly(tmp_second_mul_coeff_base.get(), coeff_count, coeff_mod_count, tmp_des_coeff_base.get() + 2 * encrypted_ptr_increment);
-            
-            // Compute (c0 + c1)*(d0 + d1) - c0*d0 - c1*d1 in base q
-            for (int i = 0; i < coeff_mod_count; i++)
-            {
-                dyadic_product_coeffmod(tmp1_poly_coeff_base.get() + (i * coeff_count), tmp2_poly_coeff_base.get() + (i * coeff_count), 
-                    coeff_count, coeff_modulus_[i], tmp_mul_poly_coeff_base.get() + (i * coeff_count));
-                sub_poly_poly_coeffmod(tmp_mul_poly_coeff_base.get() + (i * coeff_count), 
-                    tmp_first_mul_coeff_base.get() + (i * coeff_count), coeff_count, coeff_modulus_[i], 
-                    tmp_mul_poly_coeff_base.get() + (i * coeff_count));
-                
-                // Des[1] in base q
-                sub_poly_poly_coeffmod(tmp_mul_poly_coeff_base.get() + (i * coeff_count), 
-                    tmp_second_mul_coeff_base.get() + (i * coeff_count), coeff_count, coeff_modulus_[i], 
-                    tmp_des_coeff_base.get() + (i * coeff_count) + encrypted_ptr_increment);
-            }
-
-            // Set destination first and third polys in base bsk
-            // Des[0] in base bsk
-            set_poly_poly(tmp_first_mul_bsk_base.get(), coeff_count, bsk_base_mod_count_, tmp_des_bsk_base.get());
-
-            // Des[2] in base q
-            set_poly_poly(tmp_second_mul_bsk_base.get(), coeff_count, bsk_base_mod_count_, 
-                tmp_des_bsk_base.get() + 2 * encrypted_bsk_ptr_increment);
-
-            // Compute (c0 + c1)*(d0 + d1)  - c0d0 - c1d1 in base bsk
-            for (int i = 0; i < bsk_base_mod_count_; i++)
-            {
-                dyadic_product_coeffmod(tmp1_poly_bsk_base.get() + (i * coeff_count), 
-                    tmp2_poly_bsk_base.get() + (i * coeff_count), coeff_count, bsk_mod_array_[i], 
-                    tmp_mul_poly_bsk_base.get() + (i * coeff_count));
-                sub_poly_poly_coeffmod(tmp_mul_poly_bsk_base.get() + (i * coeff_count), 
-                    tmp_first_mul_bsk_base.get() + (i * coeff_count), coeff_count, bsk_mod_array_[i], 
-                    tmp_mul_poly_bsk_base.get() + (i * coeff_count));
-
-                // Des[1] in bsk
-                sub_poly_poly_coeffmod(tmp_mul_poly_bsk_base.get() + (i * coeff_count), 
-                    tmp_second_mul_bsk_base.get() + (i * coeff_count), coeff_count, bsk_mod_array_[i], 
-                    tmp_des_bsk_base.get() + (i * coeff_count) + encrypted_bsk_ptr_increment); 
-            }
-        }
-        else
-        {
-            // Perform multiplication on arbitrary size ciphertexts
-            for (int secret_power_index = 0; secret_power_index < dest_count; secret_power_index++)
-            {
-                // Loop over encrypted1 components [i], seeing if a match exists with an encrypted2 
-                // component [j] such that [i+j]=[secret_power_index]
-                // Only need to check encrypted1 components up to and including [secret_power_index], 
-                // and strictly less than [encrypted_array.size()]
-                current_encrypted1_limit = min(encrypted1_size, secret_power_index + 1);
-
-                for (int encrypted1_index = 0; encrypted1_index < current_encrypted1_limit; encrypted1_index++)
-                {
-                    // check if a corresponding component in encrypted2 exists
-                    if (encrypted2_size > secret_power_index - encrypted1_index)
-                    {
-                        int encrypted2_index = secret_power_index - encrypted1_index;
-
-                        // NTT Multiplication and addition for results in q
-                        for (int i = 0; i < coeff_mod_count; i++)
-                        {
-                            dyadic_product_coeffmod(copy_encrypted1_ntt_coeff_mod.get() + (i * coeff_count) + (encrypted_ptr_increment * encrypted1_index), 
-                                copy_encrypted2_ntt_coeff_mod.get() + (i * coeff_count) + (encrypted_ptr_increment * encrypted2_index), 
-                                coeff_count, coeff_modulus_[i], tmp1_poly_coeff_base.get() + (i * coeff_count));
-                            add_poly_poly_coeffmod(tmp1_poly_coeff_base.get() + (i * coeff_count), 
-                                tmp_des_coeff_base.get() + (i * coeff_count) + (secret_power_index * coeff_count * coeff_mod_count), coeff_count, 
-                                coeff_modulus_[i], tmp_des_coeff_base.get() + (i * coeff_count) + (secret_power_index * coeff_count * coeff_mod_count));
-                        }
-
-                        // NTT Multiplication and addition for results in Bsk
-                        for (int i = 0; i < bsk_base_mod_count_; i++)
-                        {
-                            dyadic_product_coeffmod(copy_encrypted1_ntt_bsk_base_mod.get() + (i * coeff_count) + (encrypted_bsk_ptr_increment * encrypted1_index), 
-                                copy_encrypted2_ntt_bsk_base_mod.get() + (i * coeff_count) + (encrypted_bsk_ptr_increment * encrypted2_index), 
-                                coeff_count, bsk_mod_array_[i], tmp1_poly_bsk_base.get() + (i * coeff_count));
-                            add_poly_poly_coeffmod(tmp1_poly_bsk_base.get() + (i * coeff_count), 
-                                tmp_des_bsk_base.get() + (i * coeff_count) + (secret_power_index * coeff_count * bsk_base_mod_count_), 
-                                coeff_count, bsk_mod_array_[i], 
-                                tmp_des_bsk_base.get() + (i * coeff_count) + (secret_power_index * coeff_count * bsk_base_mod_count_));
-                        }
-                    }
-                }
-            }
-        }
-        // Convert back outputs from NTT form
-        for (int i = 0; i < dest_count; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                inverse_ntt_negacyclic_harvey(tmp_des_coeff_base.get() + (i * (encrypted_ptr_increment)) + (j * coeff_count), coeff_small_ntt_tables_[j]);
-            }
-            for (int j = 0; j < bsk_base_mod_count_; j++)
-            {
-                inverse_ntt_negacyclic_harvey(tmp_des_bsk_base.get() + (i * (encrypted_bsk_ptr_increment)) + (j * coeff_count), bsk_small_ntt_tables_[j]);
-            }
-        }
-
-        // Now we multiply plain modulus to both results in base q and Bsk and allocate them together in one 
-        // container as (te0)q(te'0)Bsk | ... |te count)q (te' count)Bsk to make it ready for fast_floor 
-        Pointer tmp_coeff_bsk_together(allocate_poly(coeff_count, dest_count * (coeff_mod_count + bsk_base_mod_count_), pool));
-        uint64_t *tmp_coeff_bsk_together_ptr = tmp_coeff_bsk_together.get();
-
-        // Base q 
-        for (int i = 0; i < dest_count; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                multiply_poly_scalar_coeffmod(tmp_des_coeff_base.get() + (j * coeff_count) + (i * encrypted_ptr_increment), 
-                    coeff_count, parms_.plain_modulus().value(), coeff_modulus_[j], tmp_coeff_bsk_together_ptr + (j * coeff_count));
-            }
-            tmp_coeff_bsk_together_ptr += encrypted_ptr_increment;
-            
-            for (int k = 0; k < bsk_base_mod_count_; k++)
-            {
-                multiply_poly_scalar_coeffmod(tmp_des_bsk_base.get() + (k * coeff_count) + (i * encrypted_bsk_ptr_increment), 
-                    coeff_count, parms_.plain_modulus().value(), bsk_mod_array_[k], tmp_coeff_bsk_together_ptr + (k * coeff_count));
-            }
-            tmp_coeff_bsk_together_ptr += encrypted_bsk_ptr_increment;
-        }
-
-        // Allocate a new poly for fast floor result in Bsk
-        Pointer tmp_result_bsk(allocate_poly(coeff_count, dest_count * bsk_base_mod_count_, pool));
-        for (int i = 0; i < dest_count; i++)
-        {
-            // Step 3: fast floor from q U {Bsk} to Bsk 
-            base_converter_.fast_floor(tmp_coeff_bsk_together.get() + (i * (encrypted_ptr_increment + encrypted_bsk_ptr_increment)), 
-                tmp_result_bsk.get() + (i * encrypted_bsk_ptr_increment), pool);
-
-            // Step 4: fast base convert from Bsk to q
-            base_converter_.fastbconv_sk(tmp_result_bsk.get() + (i * encrypted_bsk_ptr_increment), encrypted1.data(i), pool);
-        }
+        // Set the scale
+        encrypted1.scale() = new_scale;
     }
 
-    void Evaluator::square(Ciphertext &encrypted, const MemoryPoolHandle &pool)
+    void Evaluator::square_inplace(Ciphertext &encrypted, MemoryPoolHandle pool)
     {
-        int encrypted_size = encrypted.size();
+        // Verify parameters.
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+
+        auto context_data_ptr = context_->first_context_data();
+        switch (context_data_ptr->parms().scheme())
+        {
+        case scheme_type::BFV:
+            bfv_square(encrypted, move(pool));
+            break;
+
+        case scheme_type::CKKS:
+            ckks_square(encrypted, move(pool));
+            break;
+
+        default:
+            throw invalid_argument("unsupported scheme");
+        }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
+    }
+
+    void Evaluator::bfv_square(Ciphertext &encrypted, MemoryPoolHandle pool)
+    {
+        if (encrypted.is_ntt_form())
+        {
+            throw invalid_argument("encrypted cannot be in NTT form");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t base_q_size = parms.coeff_modulus().size();
+        size_t encrypted_size = encrypted.size();
+
+        uint64_t plain_modulus = parms.plain_modulus().value();
+        auto rns_tool = context_data.rns_tool();
+        size_t base_Bsk_size = rns_tool->base_Bsk()->size();
+        size_t base_Bsk_m_tilde_size = rns_tool->base_Bsk_m_tilde()->size();
 
         // Optimization implemented currently only for size 2 ciphertexts
         if (encrypted_size != 2)
         {
-            multiply(encrypted, encrypted, pool);
+            bfv_multiply(encrypted, encrypted, move(pool));
             return;
         }
 
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int bsk_mtilde_count = bsk_base_mod_count_ + 1;
-        int encrypted_ptr_increment = coeff_count * coeff_mod_count;
-        int encrypted_bsk_mtilde_ptr_increment = coeff_count * bsk_mtilde_count;
-        int encrypted_bsk_ptr_increment = coeff_count * bsk_base_mod_count_;
+        // Determine destination.size()
+        size_t dest_size = sub_safe(add_safe(encrypted_size, encrypted_size), size_t(1));
 
-        // Determine destination_array.size()
-        int dest_count = (encrypted_size << 1) - 1;
-
-        // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
+        // Size check
+        if (!product_fits_in(dest_size, coeff_count, base_Bsk_m_tilde_size))
         {
-            throw invalid_argument("encrypted is not valid for encryption parameters");
-        }
-        if (!pool)
-        {
-            throw invalid_argument("pool is uninitialized");
+            throw logic_error("invalid parameters");
         }
 
-        // Prepare destination
-        encrypted.resize(parms_, dest_count);
+        // Set up iterators for bases
+        auto base_q = iter(parms.coeff_modulus());
+        auto base_Bsk = iter(rns_tool->base_Bsk()->base());
 
-        // Make temp poly for FastBConverter result from q ---> Bsk U {m_tilde}
-        Pointer tmp_encrypted_bsk_mtilde(allocate_poly(coeff_count * encrypted_size, bsk_mtilde_count, pool));
+        // Set up iterators for NTT tables
+        auto base_q_ntt_tables = iter(context_data.small_ntt_tables());
+        auto base_Bsk_ntt_tables = iter(rns_tool->base_Bsk_ntt_tables());
 
-        // Make temp poly for FastBConverter result from Bsk U {m_tilde} -----> Bsk
-        Pointer tmp_encrypted_bsk(allocate_poly(coeff_count * encrypted_size, bsk_base_mod_count_, pool));
+        // Microsoft SEAL uses BEHZ-style RNS multiplication. For details, see Evaluator::bfv_multiply. This function
+        // uses additionally Karatsuba multiplication to reduce the complexity of squaring a size-2 ciphertext, but the
+        // steps are otherwise the same as in Evaluator::bfv_multiply.
 
-        // Step 0: fast base convert from q to Bsk U {m_tilde}
-        // Step 1: reduce q-overflows in Bsk
-        // Iterate over all the ciphertexts inside encrypted1
-        for (int i = 0; i < encrypted_size; i++)
-        {
-            base_converter_.fastbconv_mtilde(encrypted.data(i),
-                tmp_encrypted_bsk_mtilde.get() + (i * encrypted_bsk_mtilde_ptr_increment), pool);
-            base_converter_.mont_rq(tmp_encrypted_bsk_mtilde.get() + (i * encrypted_bsk_mtilde_ptr_increment),
-                tmp_encrypted_bsk.get() + (i * encrypted_bsk_ptr_increment));
-        }
+        // Resize encrypted to destination size
+        encrypted.resize(context_, context_data.parms_id(), dest_size);
 
-        // Step 2: compute product and multiply plain modulus to the result
-        // We need to multiply both in q and Bsk. Values in encrypted_safe are in base q and values in 
-        // tmp_encrypted_bsk are in base Bsk
-        // We iterate over destination poly array and generate each poly based on the indices of inputs 
-        // (arbitrary sizes for ciphertexts)
-        // First allocate two temp polys: one for results in base q and the other for the result in base Bsk
-        Pointer tmp_des_coeff_base(allocate_poly(coeff_count * dest_count, coeff_mod_count, pool));
-        Pointer tmp_des_bsk_base(allocate_poly(coeff_count * dest_count, bsk_base_mod_count_, pool));
+        // This lambda function takes as input an IterTuple with three components:
+        //
+        // 1. (Const)RNSIter to read an input polynomial from
+        // 2. RNSIter for the output in base q
+        // 3. RNSIter for the output in base Bsk
+        //
+        // It performs steps (1)-(3) of the BEHZ multiplication on the given input polynomial (given as an RNSIter
+        // or ConstRNSIter) and writes the results in base q and base Bsk to the given output iterators.
+        auto behz_extend_base_convert_to_ntt = [&](auto I) {
+            // Make copy of input polynomial (in base q) and convert to NTT form
+            // Lazy reduction
+            set_poly(get<0>(I), coeff_count, base_q_size, get<1>(I));
+            ntt_negacyclic_harvey_lazy(get<1>(I), base_q_size, base_q_ntt_tables);
 
-        // First convert all the inputs into NTT form
-        Pointer copy_encrypted_ntt_coeff_mod(allocate_poly(coeff_count * encrypted_size, coeff_mod_count, pool));
-        set_poly_poly(encrypted.data(), coeff_count * encrypted_size, coeff_mod_count, copy_encrypted_ntt_coeff_mod.get());
+            // Allocate temporary space for a polynomial in the Bsk U {m_tilde} base
+            SEAL_ALLOCATE_GET_RNS_ITER(temp, coeff_count, base_Bsk_m_tilde_size, pool);
 
-        Pointer copy_encrypted_ntt_bsk_base_mod(allocate_poly(coeff_count * encrypted_size, bsk_base_mod_count_, pool));
-        set_poly_poly(tmp_encrypted_bsk.get(), coeff_count * encrypted_size, bsk_base_mod_count_, copy_encrypted_ntt_bsk_base_mod.get());
+            // (1) Convert from base q to base Bsk U {m_tilde}
+            rns_tool->fastbconv_m_tilde(get<0>(I), temp, pool);
 
-        for (int i = 0; i < encrypted_size; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                ntt_negacyclic_harvey_lazy(copy_encrypted_ntt_coeff_mod.get() + (j * coeff_count) + (i * encrypted_ptr_increment), coeff_small_ntt_tables_[j]);
-            }
-            for (int j = 0; j < bsk_base_mod_count_; j++)
-            {
-                ntt_negacyclic_harvey_lazy(copy_encrypted_ntt_bsk_base_mod.get() + (j * coeff_count) + (i * encrypted_bsk_ptr_increment), bsk_small_ntt_tables_[j]);
-            }
-        }
+            // (2) Reduce q-overflows in with Montgomery reduction, switching base to Bsk
+            rns_tool->sm_mrq(temp, get<2>(I), pool);
 
-        // Perform fast squaring
-        // Compute c0^2 in base q
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            // Des[0] in q
-            dyadic_product_coeffmod(copy_encrypted_ntt_coeff_mod.get() + (i * coeff_count),
-                copy_encrypted_ntt_coeff_mod.get() + (i * coeff_count), coeff_count, coeff_modulus_[i],
-                tmp_des_coeff_base.get() + (i * coeff_count));
+            // Transform to NTT form in base Bsk
+            // Lazy reduction
+            ntt_negacyclic_harvey_lazy(get<2>(I), base_Bsk_size, base_Bsk_ntt_tables);
+        };
 
-            // Des[2] in q
-            dyadic_product_coeffmod(copy_encrypted_ntt_coeff_mod.get() + (i * coeff_count) + encrypted_ptr_increment,
-                copy_encrypted_ntt_coeff_mod.get() + (i * coeff_count) + encrypted_ptr_increment, coeff_count,
-                coeff_modulus_[i], tmp_des_coeff_base.get() + (i * coeff_count) + (2 * encrypted_ptr_increment));
-        }
+        // Allocate space for a base q output of behz_extend_base_convert_to_ntt
+        SEAL_ALLOCATE_GET_POLY_ITER(encrypted_q, encrypted_size, coeff_count, base_q_size, pool);
 
-        // Compute c0^2 in base bsk
-        for (int i = 0; i < bsk_base_mod_count_; i++)
-        {
-            // Des[0] in bsk
-            dyadic_product_coeffmod(copy_encrypted_ntt_bsk_base_mod.get() + (i * coeff_count),
-                copy_encrypted_ntt_bsk_base_mod.get() + (i * coeff_count), coeff_count, bsk_mod_array_[i],
-                tmp_des_bsk_base.get() + (i * coeff_count));
+        // Allocate space for a base Bsk output of behz_extend_base_convert_to_ntt
+        SEAL_ALLOCATE_GET_POLY_ITER(encrypted_Bsk, encrypted_size, coeff_count, base_Bsk_size, pool);
 
-            // Des[2] in bsk
-            dyadic_product_coeffmod(copy_encrypted_ntt_bsk_base_mod.get() + (i * coeff_count) + encrypted_bsk_ptr_increment,
-                copy_encrypted_ntt_bsk_base_mod.get() + (i * coeff_count) + encrypted_bsk_ptr_increment, coeff_count,
-                bsk_mod_array_[i], tmp_des_bsk_base.get() + (i * coeff_count) + (2 * encrypted_bsk_ptr_increment));
-        }
+        // Perform BEHZ steps (1)-(3)
+        SEAL_ITERATE(iter(encrypted, encrypted_q, encrypted_Bsk), encrypted_size, behz_extend_base_convert_to_ntt);
 
-        Pointer tmp_second_mul_coeff_base(allocate_poly(coeff_count, coeff_mod_count, pool));
+        // Allocate temporary space for the output of step (4)
+        // We allocate space separately for the base q and the base Bsk components
+        SEAL_ALLOCATE_ZERO_GET_POLY_ITER(temp_dest_q, dest_size, coeff_count, base_q_size, pool);
+        SEAL_ALLOCATE_ZERO_GET_POLY_ITER(temp_dest_Bsk, dest_size, coeff_count, base_Bsk_size, pool);
 
-        // Compute 2*c0*c1 in base q
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            dyadic_product_coeffmod(copy_encrypted_ntt_coeff_mod.get() + (i * coeff_count),
-                copy_encrypted_ntt_coeff_mod.get() + (i * coeff_count) + encrypted_ptr_increment, coeff_count,
-                coeff_modulus_[i], tmp_second_mul_coeff_base.get() + (i * coeff_count));
-            add_poly_poly_coeffmod(tmp_second_mul_coeff_base.get() + (i * coeff_count),
-                tmp_second_mul_coeff_base.get() + (i * coeff_count), coeff_count, coeff_modulus_[i],
-                tmp_des_coeff_base.get() + (i * coeff_count) + encrypted_ptr_increment);
-        }
+        // Perform BEHZ step (4): dyadic Karatsuba-squaring on size-2 ciphertexts
 
-        Pointer tmp_second_mul_bsk_base(allocate_poly(coeff_count, bsk_base_mod_count_, pool));
+        // This lambda function computes the size-2 ciphertext square for BFV multiplication. Since we use the BEHZ
+        // approach, the multiplication of individual polynomials is done using a dyadic product where the inputs
+        // are already in NTT form. The arguments of the lambda function are expected to be as follows:
+        //
+        // 1. a ConstPolyIter pointing to the beginning of the input ciphertext (in NTT form)
+        // 3. a ConstModulusIter pointing to an array of Modulus elements for the base
+        // 4. the size of the base
+        // 5. a PolyIter pointing to the beginning of the output ciphertext
+        auto behz_ciphertext_square = [&](ConstPolyIter in_iter, ConstModulusIter base_iter, size_t base_size,
+                                          PolyIter out_iter) {
+            // Compute c0^2
+            dyadic_product_coeffmod(in_iter[0], in_iter[0], base_size, base_iter, out_iter[0]);
 
-        // Compute 2*c0*c1 in base bsk
-        for (int i = 0; i < bsk_base_mod_count_; i++)
-        {
-            dyadic_product_coeffmod(copy_encrypted_ntt_bsk_base_mod.get() + (i * coeff_count),
-                copy_encrypted_ntt_bsk_base_mod.get() + (i * coeff_count) + encrypted_bsk_ptr_increment,
-                coeff_count, bsk_mod_array_[i], tmp_second_mul_bsk_base.get() + (i * coeff_count));
-            add_poly_poly_coeffmod(tmp_second_mul_bsk_base.get() + (i * coeff_count),
-                tmp_second_mul_bsk_base.get() + (i * coeff_count), coeff_count, bsk_mod_array_[i],
-                tmp_des_bsk_base.get() + (i * coeff_count) + encrypted_bsk_ptr_increment);
-        }
+            // Compute 2*c0*c1
+            dyadic_product_coeffmod(in_iter[0], in_iter[1], base_size, base_iter, out_iter[1]);
+            add_poly_coeffmod(out_iter[1], out_iter[1], base_size, base_iter, out_iter[1]);
 
-        // Convert back outputs from NTT form
-        for (int i = 0; i < dest_count; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                inverse_ntt_negacyclic_harvey_lazy(tmp_des_coeff_base.get() + (i * (encrypted_ptr_increment)) + (j * coeff_count),
-                    coeff_small_ntt_tables_[j]);
-            }
-            for (int j = 0; j < bsk_base_mod_count_; j++)
-            {
-                inverse_ntt_negacyclic_harvey_lazy(tmp_des_bsk_base.get() + (i * (encrypted_bsk_ptr_increment)) + (j * coeff_count), bsk_small_ntt_tables_[j]);
-            }
-        }
+            // Compute c1^2
+            dyadic_product_coeffmod(in_iter[1], in_iter[1], base_size, base_iter, out_iter[2]);
+        };
 
-        // Now we multiply plain modulus to both results in base q and Bsk and allocate them together in one 
-        // container as (te0)q(te'0)Bsk | ... |te count)q (te' count)Bsk to make it ready for fast_floor 
-        Pointer tmp_coeff_bsk_together(allocate_poly(coeff_count, dest_count * (coeff_mod_count + bsk_base_mod_count_), pool));
-        uint64_t *tmp_coeff_bsk_together_ptr = tmp_coeff_bsk_together.get();
+        // Perform the BEHZ ciphertext square both for base q and base Bsk
+        behz_ciphertext_square(encrypted_q, base_q, base_q_size, temp_dest_q);
+        behz_ciphertext_square(encrypted_Bsk, base_Bsk, base_Bsk_size, temp_dest_Bsk);
 
-        // Base q 
-        for (int i = 0; i < dest_count; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                multiply_poly_scalar_coeffmod(tmp_des_coeff_base.get() + (j * coeff_count) + (i * encrypted_ptr_increment),
-                    coeff_count, parms_.plain_modulus().value(), coeff_modulus_[j], tmp_coeff_bsk_together_ptr + (j * coeff_count));
-            }
-            tmp_coeff_bsk_together_ptr += encrypted_ptr_increment;
+        // Perform BEHZ step (5): transform data from NTT form
+        inverse_ntt_negacyclic_harvey(temp_dest_q, dest_size, base_q_ntt_tables);
+        inverse_ntt_negacyclic_harvey(temp_dest_Bsk, dest_size, base_Bsk_ntt_tables);
 
-            for (int k = 0; k < bsk_base_mod_count_; k++)
-            {
-                multiply_poly_scalar_coeffmod(tmp_des_bsk_base.get() + (k * coeff_count) + (i * encrypted_bsk_ptr_increment),
-                    coeff_count, parms_.plain_modulus().value(), bsk_mod_array_[k], tmp_coeff_bsk_together_ptr + (k * coeff_count));
-            }
-            tmp_coeff_bsk_together_ptr += encrypted_bsk_ptr_increment;
-        }
+        // Perform BEHZ steps (6)-(8)
+        SEAL_ITERATE(iter(temp_dest_q, temp_dest_Bsk, encrypted), dest_size, [&](auto I) {
+            // Bring together the base q and base Bsk components into a single allocation
+            SEAL_ALLOCATE_GET_RNS_ITER(temp_q_Bsk, coeff_count, base_q_size + base_Bsk_size, pool);
 
-        // Allocate a new poly for fast floor result in Bsk
-        Pointer tmp_result_bsk(allocate_poly(coeff_count, dest_count * bsk_base_mod_count_, pool));
-        for (int i = 0; i < dest_count; i++)
-        {
-            // Step 3: fast floor from q U {Bsk} to Bsk 
-            base_converter_.fast_floor(tmp_coeff_bsk_together.get() + (i * (encrypted_ptr_increment + encrypted_bsk_ptr_increment)),
-                tmp_result_bsk.get() + (i * encrypted_bsk_ptr_increment), pool);
+            // Step (6): multiply base q components by t (plain_modulus)
+            multiply_poly_scalar_coeffmod(get<0>(I), base_q_size, plain_modulus, base_q, temp_q_Bsk);
 
-            // Step 4: fast base convert from Bsk to q
-            base_converter_.fastbconv_sk(tmp_result_bsk.get() + (i * encrypted_bsk_ptr_increment), encrypted.data(i), pool);
-        }
+            multiply_poly_scalar_coeffmod(get<1>(I), base_Bsk_size, plain_modulus, base_Bsk, temp_q_Bsk + base_q_size);
+
+            // Allocate yet another temporary for fast divide-and-floor result in base Bsk
+            SEAL_ALLOCATE_GET_RNS_ITER(temp_Bsk, coeff_count, base_Bsk_size, pool);
+
+            // Step (7): divide by q and floor, producing a result in base Bsk
+            rns_tool->fast_floor(temp_q_Bsk, temp_Bsk, pool);
+
+            // Step (8): use Shenoy-Kumaresan method to convert the result to base q and write to encrypted1
+            rns_tool->fastbconv_sk(temp_Bsk, get<2>(I), pool);
+        });
     }
 
-    void Evaluator::relinearize(Ciphertext &encrypted, const EvaluationKeys &evaluation_keys, int destination_size, const MemoryPoolHandle &pool)
+    void Evaluator::ckks_square(Ciphertext &encrypted, MemoryPoolHandle pool)
     {
-        // Extract encryption parameters.
-        int encrypted_size = encrypted.size();
+        if (!encrypted.is_ntt_form())
+        {
+            throw invalid_argument("encrypted must be in NTT form");
+        }
 
+        // Extract encryption parameters.
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = parms.coeff_modulus().size();
+        size_t encrypted_size = encrypted.size();
+
+        // Optimization implemented currently only for size 2 ciphertexts
+        if (encrypted_size != 2)
+        {
+            ckks_multiply(encrypted, encrypted, move(pool));
+            return;
+        }
+
+        double new_scale = encrypted.scale() * encrypted.scale();
+
+        // Check that scale is positive and not too large
+        if (new_scale <= 0 || (static_cast<int>(log2(new_scale)) >= context_data.total_coeff_modulus_bit_count()))
+        {
+            throw invalid_argument("scale out of bounds");
+        }
+
+        // Determine destination.size()
+        // Default is 3 (c_0, c_1, c_2)
+        size_t dest_size = sub_safe(add_safe(encrypted_size, encrypted_size), size_t(1));
+
+        // Size check
+        if (!product_fits_in(dest_size, coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // Set up iterator for the base
+        auto coeff_modulus = iter(parms.coeff_modulus());
+
+        // Prepare destination
+        encrypted.resize(context_, context_data.parms_id(), dest_size);
+
+        // Set up iterators for input ciphertext
+        auto encrypted_iter = iter(encrypted);
+
+        // Allocate temporary space for the result
+        SEAL_ALLOCATE_ZERO_GET_POLY_ITER(temp, dest_size, coeff_count, coeff_modulus_size, pool);
+
+        // Compute c0^2
+        dyadic_product_coeffmod(encrypted_iter[0], encrypted_iter[0], coeff_modulus_size, coeff_modulus, temp[0]);
+
+        // Compute 2*c0*c1
+        dyadic_product_coeffmod(encrypted_iter[0], encrypted_iter[1], coeff_modulus_size, coeff_modulus, temp[1]);
+        add_poly_coeffmod(temp[1], temp[1], coeff_modulus_size, coeff_modulus, temp[1]);
+
+        // Compute c1^2
+        dyadic_product_coeffmod(encrypted_iter[1], encrypted_iter[1], coeff_modulus_size, coeff_modulus, temp[2]);
+
+        // Set the final result
+        set_poly_array(temp, dest_size, coeff_count, coeff_modulus_size, encrypted.data());
+
+        // Set the scale
+        encrypted.scale() = new_scale;
+    }
+
+    void Evaluator::relinearize_internal(
+        Ciphertext &encrypted, const RelinKeys &relin_keys, size_t destination_size, MemoryPoolHandle pool)
+    {
         // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
+        auto context_data_ptr = context_->get_context_data(encrypted.parms_id());
+        if (!context_data_ptr)
         {
             throw invalid_argument("encrypted is not valid for encryption parameters");
         }
+        if (relin_keys.parms_id() != context_->key_parms_id())
+        {
+            throw invalid_argument("relin_keys is not valid for encryption parameters");
+        }
+
+        size_t encrypted_size = encrypted.size();
+
+        // Verify parameters.
         if (destination_size < 2 || destination_size > encrypted_size)
         {
-            throw invalid_argument("destination_size must be greater than or equal to 2 and less than or equal to current count");
+            throw invalid_argument("destination_size must be at least 2 and less than or equal to current count");
         }
-        if (evaluation_keys.hash_block() != parms_.hash_block())
+        if (relin_keys.size() < sub_safe(encrypted_size, size_t(2)))
         {
-            throw invalid_argument("evaluation_keys is not valid for encryption parameters");
-        }
-        if (evaluation_keys.size() < encrypted_size - 2)
-        {
-            throw invalid_argument("not enough evaluation keys");
-        }
-        if (!pool)
-        {
-            throw invalid_argument("pool is uninitialized");
+            throw invalid_argument("not enough relinearization keys");
         }
 
         // If encrypted is already at the desired level, return
@@ -917,158 +801,385 @@ namespace seal
         }
 
         // Calculate number of relinearize_one_step calls needed
-        int relins_needed = encrypted_size - destination_size;
+        size_t relins_needed = encrypted_size - destination_size;
 
-        // Update temp to store the current result after relinearization
-        for (int i = 0; i < relins_needed; i++)
-        {
-            relinearize_one_step(encrypted.data(), encrypted_size, evaluation_keys, pool);
-            encrypted_size--;
-        }
+        // Iterator pointing to the last component of encrypted
+        auto encrypted_iter = iter(encrypted);
+        encrypted_iter += encrypted_size - 1;
+
+        SEAL_ITERATE(iter(size_t(0)), relins_needed, [&](auto I) {
+            this->switch_key_inplace(
+                encrypted, *encrypted_iter, static_cast<const KSwitchKeys &>(relin_keys),
+                RelinKeys::get_index(encrypted_size - 1 - I), pool);
+        });
 
         // Put the output of final relinearization into destination.
         // Prepare destination only at this point because we are resizing down
-        encrypted.resize(parms_, destination_size);
+        encrypted.resize(context_, context_data_ptr->parms_id(), destination_size);
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
     }
 
-    void Evaluator::relinearize_one_step(uint64_t *encrypted, int encrypted_size, const EvaluationKeys &evaluation_keys, const MemoryPoolHandle &pool)
+    void Evaluator::mod_switch_scale_to_next(
+        const Ciphertext &encrypted, Ciphertext &destination, MemoryPoolHandle pool)
     {
-#ifdef SEAL_DEBUG
-        if (encrypted == nullptr)
+        // Assuming at this point encrypted is already validated.
+        auto context_data_ptr = context_->get_context_data(encrypted.parms_id());
+        if (context_data_ptr->parms().scheme() == scheme_type::BFV && encrypted.is_ntt_form())
         {
-            throw invalid_argument("encrypted cannot be null");
+            throw invalid_argument("BFV encrypted cannot be in NTT form");
         }
-        if (encrypted_size <= 2)
+        if (context_data_ptr->parms().scheme() == scheme_type::CKKS && !encrypted.is_ntt_form())
         {
-            throw invalid_argument("encrypted_size must be at least 3");
-        }
-        if (evaluation_keys.hash_block() != parms_.hash_block())
-        {
-            throw invalid_argument("evaluation_keys is not valid for encryption parameters");
-        }
-        if (evaluation_keys.size() < encrypted_size - 2)
-        {
-            throw invalid_argument("not enough evaluation keys");
+            throw invalid_argument("CKKS encrypted must be in NTT form");
         }
         if (!pool)
         {
             throw invalid_argument("pool is uninitialized");
         }
-#endif
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int array_poly_uint64_count = coeff_count * coeff_mod_count;
 
-        const uint64_t *encrypted_coeff = encrypted + (encrypted_size - 1) * array_poly_uint64_count;
-        Pointer encrypted_coeff_prod_inv_coeff(allocate_uint(coeff_count, pool));
+        // Extract encryption parameters.
+        auto &context_data = *context_data_ptr;
+        auto &next_context_data = *context_data.next_context_data();
+        auto &next_parms = next_context_data.parms();
+        auto rns_tool = context_data.rns_tool();
 
-        // Decompose encrypted_array[count-1] into base w
-        // Want to create an array of polys, each of whose components i is (encrypted_array[count-1])^(i) - in the notation of FV paper
-        // This allocation stores one of the decomposed factors modulo one of the primes
-        Pointer decomp_encrypted_last(allocate_uint(coeff_count, pool));
+        size_t encrypted_size = encrypted.size();
+        size_t coeff_count = next_parms.poly_modulus_degree();
+        size_t next_coeff_modulus_size = next_parms.coeff_modulus().size();
 
-        // Lazy reduction   
-        Pointer wide_innerresult0(allocate_zero_poly(coeff_count, 2 * coeff_mod_count, pool));
-        Pointer wide_innerresult1(allocate_zero_poly(coeff_count, 2 * coeff_mod_count, pool));
-        Pointer innerresult(allocate_poly(coeff_count, coeff_mod_count, pool));
-        Pointer temp_decomp_coeff(allocate_uint(coeff_count, pool));
+        Ciphertext encrypted_copy(pool);
+        encrypted_copy = encrypted;
 
-        /*
-        For lazy reduction to work here, we need to ensure that the 128-bit accumulators (wide_innerresult0 and wide_innerresult1)
-        do not overflow. Since the modulus primes are at most 60 bits, if the total number of summands is K, then the size of the
-        total sum of products (without reduction) is at most 62 + 60 + bit_length(K). We need this to be at most 128, thus we need
-        bit_length(K) <= 6. Thus, we need K <= 63. In this case, this means sum_i evaluation_keys.data()[0][i].size() / 2 <= 63.
-        */
-        for (int i = 0; i < coeff_mod_count; i++)
+        switch (next_parms.scheme())
         {
-            multiply_poly_scalar_coeffmod(encrypted_coeff + (i * coeff_count), coeff_count, 
-                inv_coeff_products_mod_coeff_array_[i], coeff_modulus_[i], encrypted_coeff_prod_inv_coeff.get());
+        case scheme_type::BFV:
+            SEAL_ITERATE(iter(encrypted_copy), encrypted_size, [&](auto I) {
+                rns_tool->divide_and_round_q_last_inplace(I, pool);
+            });
+            break;
 
-            int shift = 0;
-            const Ciphertext &key_component_ref = evaluation_keys.data()[0][i];
-            int keys_size = key_component_ref.size();
-            for (int k = 0; k < keys_size; k += 2)
-            {
-                const uint64_t *key_ptr_0 = key_component_ref.data(k);
-                const uint64_t *key_ptr_1 = key_component_ref.data(k + 1);
+        case scheme_type::CKKS:
+            SEAL_ITERATE(iter(encrypted_copy), encrypted_size, [&](auto I) {
+                rns_tool->divide_and_round_q_last_ntt_inplace(I, context_data.small_ntt_tables(), pool);
+            });
+            break;
 
-                // Decompose here
-                int decomposition_bit_count = evaluation_keys.decomposition_bit_count();
-                for (int coeff_index = 0; coeff_index < coeff_count; coeff_index++)
-                {
-                    decomp_encrypted_last[coeff_index] = encrypted_coeff_prod_inv_coeff[coeff_index] >> shift;
-                    decomp_encrypted_last[coeff_index] &= (1ULL << decomposition_bit_count) - 1;
-                }
-
-                uint64_t *wide_innerresult0_ptr = wide_innerresult0.get();
-                uint64_t *wide_innerresult1_ptr = wide_innerresult1.get();
-                for (int j = 0; j < coeff_mod_count; j++)
-                {
-                    uint64_t *temp_decomp_coeff_ptr = temp_decomp_coeff.get();
-                    set_uint_uint(decomp_encrypted_last.get(), coeff_count, temp_decomp_coeff_ptr);
-
-                    // We don't reduce here, so might get up to two extra bits. Thus 62 bits at most.
-                    ntt_negacyclic_harvey_lazy(temp_decomp_coeff_ptr, coeff_small_ntt_tables_[j]);
-
-                    // Lazy reduction
-                    uint64_t wide_innerproduct[2];
-                    for (int m = 0; m < coeff_count; m++, wide_innerresult0_ptr += 2)
-                    {
-                        multiply_uint64(*temp_decomp_coeff_ptr++, *key_ptr_0++, wide_innerproduct);
-                        unsigned char carry = add_uint64(wide_innerresult0_ptr[0], wide_innerproduct[0], 0,
-                            wide_innerresult0_ptr);
-                        wide_innerresult0_ptr[1] += wide_innerproduct[1] + carry;
-                    }
-
-                    temp_decomp_coeff_ptr = temp_decomp_coeff.get();
-                    for (int m = 0; m < coeff_count; m++, wide_innerresult1_ptr += 2)
-                    {
-                        multiply_uint64(*temp_decomp_coeff_ptr++, *key_ptr_1++, wide_innerproduct);
-                        unsigned char carry = add_uint64(wide_innerresult1_ptr[0], wide_innerproduct[0], 0,
-                            wide_innerresult1_ptr);
-                        wide_innerresult1_ptr[1] += wide_innerproduct[1] + carry;
-                    }
-                }
-                shift += decomposition_bit_count;
-            }
+        default:
+            throw invalid_argument("unsupported scheme");
         }
 
-        uint64_t *innerresult_poly_ptr = innerresult.get();
-        uint64_t *wide_innerresult_poly_ptr = wide_innerresult0.get();
-        uint64_t *encrypted_ptr = encrypted;
-        uint64_t *innerresult_coeff_ptr = innerresult_poly_ptr;
-        uint64_t *wide_innerresult_coeff_ptr = wide_innerresult_poly_ptr;
-        for (int i = 0; i < coeff_mod_count; i++, innerresult_poly_ptr += coeff_count,
-            wide_innerresult_poly_ptr += 2 * coeff_count, encrypted_ptr += coeff_count)
-        {
-            for (int m = 0; m < coeff_count; m++, wide_innerresult_coeff_ptr += 2)
-            {
-                *innerresult_coeff_ptr++ = barrett_reduce_128(wide_innerresult_coeff_ptr, coeff_modulus_[i]);
-            }
-            inverse_ntt_negacyclic_harvey(innerresult_poly_ptr, coeff_small_ntt_tables_[i]);
-            add_poly_poly_coeffmod(encrypted_ptr, innerresult_poly_ptr, coeff_count,
-                coeff_modulus_[i], encrypted_ptr);
-        }
+        // Copy result to destination
+        destination.resize(context_, next_context_data.parms_id(), encrypted_size);
+        SEAL_ITERATE(iter(encrypted_copy, destination), encrypted_size, [&](auto I) {
+            set_poly(get<0>(I), coeff_count, next_coeff_modulus_size, get<1>(I));
+        });
 
-        innerresult_poly_ptr = innerresult.get();
-        wide_innerresult_poly_ptr = wide_innerresult1.get();
-        encrypted_ptr = encrypted + array_poly_uint64_count;
-        innerresult_coeff_ptr = innerresult_poly_ptr;
-        wide_innerresult_coeff_ptr = wide_innerresult_poly_ptr;
-        for (int i = 0; i < coeff_mod_count; i++, innerresult_poly_ptr += coeff_count,
-            wide_innerresult_poly_ptr += 2 * coeff_count, encrypted_ptr += coeff_count)
+        // Set other attributes
+        destination.is_ntt_form() = encrypted.is_ntt_form();
+        if (next_parms.scheme() == scheme_type::CKKS)
         {
-            for (int m = 0; m < coeff_count; m++, wide_innerresult_coeff_ptr += 2)
-            {
-                *innerresult_coeff_ptr++ = barrett_reduce_128(wide_innerresult_coeff_ptr, coeff_modulus_[i]);
-            }
-            inverse_ntt_negacyclic_harvey(innerresult_poly_ptr, coeff_small_ntt_tables_[i]);
-            add_poly_poly_coeffmod(encrypted_ptr, innerresult_poly_ptr, coeff_count,
-                coeff_modulus_[i], encrypted_ptr);
+            // Change the scale when using CKKS
+            destination.scale() =
+                encrypted.scale() / static_cast<double>(context_data.parms().coeff_modulus().back().value());
         }
     }
 
-    void Evaluator::multiply_many(vector<Ciphertext> &encrypteds, const EvaluationKeys &evaluation_keys, Ciphertext &destination, const MemoryPoolHandle &pool)
+    void Evaluator::mod_switch_drop_to_next(const Ciphertext &encrypted, Ciphertext &destination, MemoryPoolHandle pool)
+    {
+        // Assuming at this point encrypted is already validated.
+        auto context_data_ptr = context_->get_context_data(encrypted.parms_id());
+        if (context_data_ptr->parms().scheme() == scheme_type::CKKS && !encrypted.is_ntt_form())
+        {
+            throw invalid_argument("CKKS encrypted must be in NTT form");
+        }
+
+        // Extract encryption parameters.
+        auto &next_context_data = *context_data_ptr->next_context_data();
+        auto &next_parms = next_context_data.parms();
+
+        // Check that scale is positive and not too large
+        if (encrypted.scale() <= 0 ||
+            (static_cast<int>(log2(encrypted.scale())) >= next_context_data.total_coeff_modulus_bit_count()))
+        {
+            throw invalid_argument("scale out of bounds");
+        }
+
+        // q_1,...,q_{k-1}
+        size_t next_coeff_modulus_size = next_parms.coeff_modulus().size();
+        size_t coeff_count = next_parms.poly_modulus_degree();
+        size_t encrypted_size = encrypted.size();
+
+        // Size check
+        if (!product_fits_in(encrypted_size, coeff_count, next_coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        auto drop_modulus_and_copy = [&](ConstPolyIter in_iter, PolyIter out_iter) {
+            SEAL_ITERATE(iter(in_iter, out_iter), encrypted_size, [&](auto I) {
+                SEAL_ITERATE(
+                    iter(I), next_coeff_modulus_size, [&](auto J) { set_uint(get<0>(J), coeff_count, get<1>(J)); });
+            });
+        };
+
+        if (&encrypted == &destination)
+        {
+            // Switching in-place so need temporary space
+            SEAL_ALLOCATE_GET_POLY_ITER(temp, encrypted_size, coeff_count, next_coeff_modulus_size, pool);
+
+            // Copy data over to temp; only copy the RNS components relevant after modulus drop
+            drop_modulus_and_copy(encrypted, temp);
+
+            // Resize destination before writing
+            destination.resize(context_, next_context_data.parms_id(), encrypted_size);
+            destination.is_ntt_form() = true;
+            destination.scale() = encrypted.scale();
+
+            // Copy data to destination
+            set_poly_array(temp, encrypted_size, coeff_count, next_coeff_modulus_size, destination.data());
+        }
+        else
+        {
+            // Resize destination before writing
+            destination.resize(context_, next_context_data.parms_id(), encrypted_size);
+            destination.is_ntt_form() = true;
+            destination.scale() = encrypted.scale();
+
+            // Copy data over to destination; only copy the RNS components relevant after modulus drop
+            drop_modulus_and_copy(encrypted, destination);
+        }
+    }
+
+    void Evaluator::mod_switch_drop_to_next(Plaintext &plain)
+    {
+        // Assuming at this point plain is already validated.
+        auto context_data_ptr = context_->get_context_data(plain.parms_id());
+        if (!plain.is_ntt_form())
+        {
+            throw invalid_argument("plain is not in NTT form");
+        }
+        if (!context_data_ptr->next_context_data())
+        {
+            throw invalid_argument("end of modulus switching chain reached");
+        }
+
+        // Extract encryption parameters.
+        auto &next_context_data = *context_data_ptr->next_context_data();
+        auto &next_parms = context_data_ptr->next_context_data()->parms();
+
+        // Check that scale is positive and not too large
+        if (plain.scale() <= 0 ||
+            (static_cast<int>(log2(plain.scale())) >= next_context_data.total_coeff_modulus_bit_count()))
+        {
+            throw invalid_argument("scale out of bounds");
+        }
+
+        // q_1,...,q_{k-1}
+        auto &next_coeff_modulus = next_parms.coeff_modulus();
+        size_t next_coeff_modulus_size = next_coeff_modulus.size();
+        size_t coeff_count = next_parms.poly_modulus_degree();
+
+        // Compute destination size first for exception safety
+        auto dest_size = mul_safe(next_coeff_modulus_size, coeff_count);
+
+        plain.parms_id() = parms_id_zero;
+        plain.resize(dest_size);
+        plain.parms_id() = next_context_data.parms_id();
+    }
+
+    void Evaluator::mod_switch_to_next(const Ciphertext &encrypted, Ciphertext &destination, MemoryPoolHandle pool)
+    {
+        // Verify parameters.
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+
+        auto context_data_ptr = context_->get_context_data(encrypted.parms_id());
+        if (context_->last_parms_id() == encrypted.parms_id())
+        {
+            throw invalid_argument("end of modulus switching chain reached");
+        }
+        if (!pool)
+        {
+            throw invalid_argument("pool is uninitialized");
+        }
+
+        switch (context_->first_context_data()->parms().scheme())
+        {
+        case scheme_type::BFV:
+            // Modulus switching with scaling
+            mod_switch_scale_to_next(encrypted, destination, move(pool));
+            break;
+
+        case scheme_type::CKKS:
+            // Modulus switching without scaling
+            mod_switch_drop_to_next(encrypted, destination, move(pool));
+            break;
+
+        default:
+            throw invalid_argument("unsupported scheme");
+        }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (destination.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
+    }
+
+    void Evaluator::mod_switch_to_inplace(Ciphertext &encrypted, parms_id_type parms_id, MemoryPoolHandle pool)
+    {
+        // Verify parameters.
+        auto context_data_ptr = context_->get_context_data(encrypted.parms_id());
+        auto target_context_data_ptr = context_->get_context_data(parms_id);
+        if (!context_data_ptr)
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+        if (!target_context_data_ptr)
+        {
+            throw invalid_argument("parms_id is not valid for encryption parameters");
+        }
+        if (context_data_ptr->chain_index() < target_context_data_ptr->chain_index())
+        {
+            throw invalid_argument("cannot switch to higher level modulus");
+        }
+
+        while (encrypted.parms_id() != parms_id)
+        {
+            mod_switch_to_next_inplace(encrypted, pool);
+        }
+    }
+
+    void Evaluator::mod_switch_to_inplace(Plaintext &plain, parms_id_type parms_id)
+    {
+        // Verify parameters.
+        auto context_data_ptr = context_->get_context_data(plain.parms_id());
+        auto target_context_data_ptr = context_->get_context_data(parms_id);
+        if (!context_data_ptr)
+        {
+            throw invalid_argument("plain is not valid for encryption parameters");
+        }
+        if (!context_->get_context_data(parms_id))
+        {
+            throw invalid_argument("parms_id is not valid for encryption parameters");
+        }
+        if (!plain.is_ntt_form())
+        {
+            throw invalid_argument("plain is not in NTT form");
+        }
+        if (context_data_ptr->chain_index() < target_context_data_ptr->chain_index())
+        {
+            throw invalid_argument("cannot switch to higher level modulus");
+        }
+
+        while (plain.parms_id() != parms_id)
+        {
+            mod_switch_to_next_inplace(plain);
+        }
+    }
+
+    void Evaluator::rescale_to_next(const Ciphertext &encrypted, Ciphertext &destination, MemoryPoolHandle pool)
+    {
+        // Verify parameters.
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+        if (context_->last_parms_id() == encrypted.parms_id())
+        {
+            throw invalid_argument("end of modulus switching chain reached");
+        }
+        if (!pool)
+        {
+            throw invalid_argument("pool is uninitialized");
+        }
+
+        switch (context_->first_context_data()->parms().scheme())
+        {
+        case scheme_type::BFV:
+            throw invalid_argument("unsupported operation for scheme type");
+
+        case scheme_type::CKKS:
+            // Modulus switching with scaling
+            mod_switch_scale_to_next(encrypted, destination, move(pool));
+            break;
+
+        default:
+            throw invalid_argument("unsupported scheme");
+        }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (destination.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
+    }
+
+    void Evaluator::rescale_to_inplace(Ciphertext &encrypted, parms_id_type parms_id, MemoryPoolHandle pool)
+    {
+        // Verify parameters.
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+
+        auto context_data_ptr = context_->get_context_data(encrypted.parms_id());
+        auto target_context_data_ptr = context_->get_context_data(parms_id);
+        if (!context_data_ptr)
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+        if (!target_context_data_ptr)
+        {
+            throw invalid_argument("parms_id is not valid for encryption parameters");
+        }
+        if (context_data_ptr->chain_index() < target_context_data_ptr->chain_index())
+        {
+            throw invalid_argument("cannot switch to higher level modulus");
+        }
+        if (!pool)
+        {
+            throw invalid_argument("pool is uninitialized");
+        }
+
+        switch (context_data_ptr->parms().scheme())
+        {
+        case scheme_type::BFV:
+            throw invalid_argument("unsupported operation for scheme type");
+
+        case scheme_type::CKKS:
+            while (encrypted.parms_id() != parms_id)
+            {
+                // Modulus switching with scaling
+                mod_switch_scale_to_next(encrypted, encrypted, pool);
+            }
+            break;
+
+        default:
+            throw invalid_argument("unsupported scheme");
+        }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
+    }
+
+    void Evaluator::multiply_many(
+        const vector<Ciphertext> &encrypteds, const RelinKeys &relin_keys, Ciphertext &destination,
+        MemoryPoolHandle pool)
     {
         // Verify parameters.
         if (encrypteds.size() == 0)
@@ -1079,717 +1190,767 @@ namespace seal
         {
             throw invalid_argument("pool is uninitialized");
         }
+        for (size_t i = 0; i < encrypteds.size(); i++)
+        {
+            if (&encrypteds[i] == &destination)
+            {
+                throw invalid_argument("encrypteds must be different from destination");
+            }
+        }
 
-        // If there is only one ciphertext, return it after checking validity.
+        // There is at least one ciphertext
+        auto context_data_ptr = context_->get_context_data(encrypteds[0].parms_id());
+        if (!context_data_ptr)
+        {
+            throw invalid_argument("encrypteds is not valid for encryption parameters");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_data_ptr;
+        auto &parms = context_data.parms();
+
+        if (parms.scheme() != scheme_type::BFV)
+        {
+            throw logic_error("unsupported scheme");
+        }
+
+        // If there is only one ciphertext, return it.
         if (encrypteds.size() == 1)
         {
-            // Verify parameters.
-            if (encrypteds[0].hash_block_ != parms_.hash_block())
-            {
-                throw invalid_argument("encrypteds is not valid for encryption parameters");
-            }
             destination = encrypteds[0];
             return;
         }
 
-        // Repeatedly multiply and add to the back of the vector until the end is reached
-        Ciphertext product(parms_, pool);
+        // Do first level of multiplications
+        vector<Ciphertext> product_vec;
         for (size_t i = 0; i < encrypteds.size() - 1; i += 2)
         {
-            // We only compare pointers to determine if a faster path can be taken.
-            // This is under the assumption that if the two pointers are the same and
-            // the parameter sets match, then it makes no sense for one of the ciphertexts
-            // to be of different size than the other. More generally, it seems like 
-            // a reasonable assumption that if the pointers are the same, then the
-            // ciphertexts are the same.
+            Ciphertext temp(context_, context_data.parms_id(), pool);
             if (encrypteds[i].data() == encrypteds[i + 1].data())
             {
-                square(encrypteds[i], product, pool);
+                square(encrypteds[i], temp);
             }
             else
             {
-                multiply(encrypteds[i], encrypteds[i + 1], product, pool);
+                multiply(encrypteds[i], encrypteds[i + 1], temp);
             }
-            relinearize(product, evaluation_keys, pool);
-            encrypteds.emplace_back(product);
+            relinearize_inplace(temp, relin_keys, pool);
+            product_vec.emplace_back(move(temp));
         }
-        destination = encrypteds[encrypteds.size() - 1];
+        if (encrypteds.size() & 1)
+        {
+            product_vec.emplace_back(encrypteds.back());
+        }
+
+        // Repeatedly multiply and add to the back of the vector until the end is reached
+        for (size_t i = 0; i < product_vec.size() - 1; i += 2)
+        {
+            Ciphertext temp(context_, context_data.parms_id(), pool);
+            multiply(product_vec[i], product_vec[i + 1], temp);
+            relinearize_inplace(temp, relin_keys, pool);
+            product_vec.emplace_back(move(temp));
+        }
+
+        destination = product_vec.back();
     }
 
-    void Evaluator::exponentiate(Ciphertext &encrypted, uint64_t exponent, const EvaluationKeys &evaluation_keys, const MemoryPoolHandle &pool)
+    void Evaluator::exponentiate_inplace(
+        Ciphertext &encrypted, uint64_t exponent, const RelinKeys &relin_keys, MemoryPoolHandle pool)
     {
         // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
+        auto context_data_ptr = context_->get_context_data(encrypted.parms_id());
+        if (!context_data_ptr)
         {
             throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+        if (!context_->get_context_data(relin_keys.parms_id()))
+        {
+            throw invalid_argument("relin_keys is not valid for encryption parameters");
+        }
+        if (!pool)
+        {
+            throw invalid_argument("pool is uninitialized");
         }
         if (exponent == 0)
         {
             throw invalid_argument("exponent cannot be 0");
         }
-        if (!pool)
-        {
-            throw invalid_argument("pool is uninitialized");
-        }
 
+        // Fast case
         if (exponent == 1)
         {
             return;
         }
 
-        // Create a vector of aliased ciphertexts
-        vector<Ciphertext> exp_vector(exponent, Ciphertext(parms_, encrypted.size(), encrypted.data()));
-        multiply_many(exp_vector, evaluation_keys, encrypted, pool);
+        // Create a vector of copies of encrypted
+        vector<Ciphertext> exp_vector(static_cast<size_t>(exponent), encrypted);
+        multiply_many(exp_vector, relin_keys, encrypted, move(pool));
     }
 
-    void Evaluator::add_plain(Ciphertext &encrypted, const Plaintext &plain)
+    void Evaluator::add_plain_inplace(Ciphertext &encrypted, const Plaintext &plain)
     {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-
         // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
         {
             throw invalid_argument("encrypted is not valid for encryption parameters");
         }
-        if (plain.coeff_count() > coeff_count || (plain.coeff_count() == coeff_count && plain[coeff_count - 1] != 0))
+        if (!is_metadata_valid_for(plain, context_) || !is_buffer_valid(plain))
         {
             throw invalid_argument("plain is not valid for encryption parameters");
         }
-#ifdef SEAL_DEBUG
-        if (plain.significant_coeff_count() >= coeff_count || !are_poly_coefficients_less_than(plain.data(), 
-            plain.coeff_count(), 1, parms_.plain_modulus().data(), 1))
+
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        if (parms.scheme() == scheme_type::BFV && encrypted.is_ntt_form())
         {
-            throw invalid_argument("plain is not valid for encryption parameters");
+            throw invalid_argument("BFV encrypted cannot be in NTT form");
+        }
+        if (parms.scheme() == scheme_type::CKKS && !encrypted.is_ntt_form())
+        {
+            throw invalid_argument("CKKS encrypted must be in NTT form");
+        }
+        if (plain.is_ntt_form() != encrypted.is_ntt_form())
+        {
+            throw invalid_argument("NTT form mismatch");
+        }
+        if (encrypted.is_ntt_form() && (encrypted.parms_id() != plain.parms_id()))
+        {
+            throw invalid_argument("encrypted and plain parameter mismatch");
+        }
+        if (!are_same_scale(encrypted, plain))
+        {
+            throw invalid_argument("scale mismatch");
+        }
+
+        // Extract encryption parameters.
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        switch (parms.scheme())
+        {
+        case scheme_type::BFV:
+        {
+            multiply_add_plain_with_scaling_variant(plain, context_data, *iter(encrypted));
+            break;
+        }
+
+        case scheme_type::CKKS:
+        {
+            RNSIter encrypted_iter(encrypted.data(), coeff_count);
+            ConstRNSIter plain_iter(plain.data(), coeff_count);
+            add_poly_coeffmod(encrypted_iter, plain_iter, coeff_modulus_size, coeff_modulus, encrypted_iter);
+            break;
+        }
+
+        default:
+            throw invalid_argument("unsupported scheme");
+        }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
         }
 #endif
-        // This is Encryptor::preencrypt
-        // Multiply plain by scalar coeff_div_plain_modulus_ and reposition if in upper-half.
-        for (int i = 0; i < plain.coeff_count(); i++)
-        {
-            if (plain[i] >= plain_upper_half_threshold_)
-            {
-                // Loop over primes
-                for (int j = 0; j < coeff_mod_count; j++)
-                {
-                    uint64_t temp[2]{ 0 };
-                    multiply_uint64(*(coeff_div_plain_modulus_.get() + j), plain[i], temp);
-                    temp[1] += add_uint64(temp[0], *(upper_half_increment_.get() + j), 0, temp);
-                    uint64_t scaled_plain_coeff = barrett_reduce_128(temp, coeff_modulus_[j]);
-                    *(encrypted.data() + i + (j * coeff_count)) = add_uint_uint_mod(encrypted[i + (j * coeff_count)], scaled_plain_coeff, coeff_modulus_[j]);
-                }
-            }
-            else
-            {
-                for (int j = 0; j < coeff_mod_count; j++)
-                {
-                    uint64_t scaled_plain_coeff = multiply_uint_uint_mod(coeff_div_plain_modulus_[j], plain[i], coeff_modulus_[j]);
-                    *(encrypted.data() + i + (j * coeff_count)) = add_uint_uint_mod(encrypted[i + (j * coeff_count)], scaled_plain_coeff, coeff_modulus_[j]);
-                }
-            }
-        }
     }
 
-    void Evaluator::sub_plain(Ciphertext &encrypted, const Plaintext &plain)
+    void Evaluator::sub_plain_inplace(Ciphertext &encrypted, const Plaintext &plain)
     {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-
         // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
         {
             throw invalid_argument("encrypted is not valid for encryption parameters");
         }
-        if (plain.coeff_count() > coeff_count || (plain.coeff_count() == coeff_count && plain[coeff_count - 1] != 0))
+        if (!is_metadata_valid_for(plain, context_) || !is_buffer_valid(plain))
         {
             throw invalid_argument("plain is not valid for encryption parameters");
         }
-#ifdef SEAL_DEBUG
-        if (plain.significant_coeff_count() >= coeff_count || !are_poly_coefficients_less_than(plain.data(), 
-            plain.coeff_count(), 1, parms_.plain_modulus().data(), 1))
+
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        if (parms.scheme() == scheme_type::BFV && encrypted.is_ntt_form())
         {
-            throw invalid_argument("plain is not valid for encryption parameters");
+            throw invalid_argument("BFV encrypted cannot be in NTT form");
+        }
+        if (parms.scheme() == scheme_type::CKKS && !encrypted.is_ntt_form())
+        {
+            throw invalid_argument("CKKS encrypted must be in NTT form");
+        }
+        if (plain.is_ntt_form() != encrypted.is_ntt_form())
+        {
+            throw invalid_argument("NTT form mismatch");
+        }
+        if (encrypted.is_ntt_form() && (encrypted.parms_id() != plain.parms_id()))
+        {
+            throw invalid_argument("encrypted and plain parameter mismatch");
+        }
+        if (!are_same_scale(encrypted, plain))
+        {
+            throw invalid_argument("scale mismatch");
+        }
+
+        // Extract encryption parameters.
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        switch (parms.scheme())
+        {
+        case scheme_type::BFV:
+        {
+            multiply_sub_plain_with_scaling_variant(plain, context_data, *iter(encrypted));
+            break;
+        }
+
+        case scheme_type::CKKS:
+        {
+            RNSIter encrypted_iter(encrypted.data(), coeff_count);
+            ConstRNSIter plain_iter(plain.data(), coeff_count);
+            sub_poly_coeffmod(encrypted_iter, plain_iter, coeff_modulus_size, coeff_modulus, encrypted_iter);
+            break;
+        }
+
+        default:
+            throw invalid_argument("unsupported scheme");
+        }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
         }
 #endif
-        // This is Encryptor::preencrypt changed to subtract instead
-        // Multiply plain by scalar coeff_div_plain_modulus_ and reposition if in upper-half.
-        for (int i = 0; i < plain.coeff_count(); i++)
-        {
-            if (plain[i] >= plain_upper_half_threshold_)
-            {
-                // Loop over primes
-                for (int j = 0; j < coeff_mod_count; j++)
-                {
-                    uint64_t temp[2]{ 0 };
-                    multiply_uint64(*(coeff_div_plain_modulus_.get() + j), plain[i], temp);
-                    temp[1] += add_uint64(temp[0], *(upper_half_increment_.get() + j), 0, temp);
-                    uint64_t scaled_plain_coeff = barrett_reduce_128(temp, coeff_modulus_[j]);
-                    *(encrypted.data() + i + (j * coeff_count)) = sub_uint_uint_mod(encrypted[i + (j * coeff_count)], scaled_plain_coeff, coeff_modulus_[j]);
-                }
-            }
-            else
-            {
-                for (int j = 0; j < coeff_mod_count; j++)
-                {
-                    uint64_t scaled_plain_coeff = multiply_uint_uint_mod(coeff_div_plain_modulus_[j], plain[i], coeff_modulus_[j]);
-                    *(encrypted.data() + i + (j * coeff_count)) = sub_uint_uint_mod(encrypted[i + (j * coeff_count)], scaled_plain_coeff, coeff_modulus_[j]);
-                }
-            }
-        }
     }
 
-    void Evaluator::multiply_plain(Ciphertext &encrypted, const Plaintext &plain, const MemoryPoolHandle &pool)
+    void Evaluator::multiply_plain_inplace(Ciphertext &encrypted, const Plaintext &plain, MemoryPoolHandle pool)
     {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int encrypted_size = encrypted.size();
-        int plain_coeff_count = plain.coeff_count();
-
         // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
         {
             throw invalid_argument("encrypted is not valid for encryption parameters");
         }
-#ifdef SEAL_THROW_ON_MULTIPLY_PLAIN_BY_ZERO
-        if (plain.is_zero())
-        {
-            throw invalid_argument("plain cannot be zero");
-        }
-#endif
-        if (plain.coeff_count() > coeff_count || (plain.coeff_count() == coeff_count && plain[coeff_count - 1] != 0))
+        if (!is_metadata_valid_for(plain, context_) || !is_buffer_valid(plain))
         {
             throw invalid_argument("plain is not valid for encryption parameters");
         }
-#ifdef SEAL_DEBUG
-        if (plain.significant_coeff_count() >= coeff_count || !are_poly_coefficients_less_than(plain.data(), 
-            plain.coeff_count(), 1, parms_.plain_modulus().data(), 1))
+        if (encrypted.is_ntt_form() != plain.is_ntt_form())
         {
-            throw invalid_argument("plain is not valid for encryption parameters");
+            throw invalid_argument("NTT form mismatch");
         }
-#endif
         if (!pool)
         {
             throw invalid_argument("pool is uninitialized");
         }
 
-        // Multiplying just by a constant?
-        if (plain_coeff_count == 1)
+        if (encrypted.is_ntt_form())
         {
-            if (!qualifiers_.enable_fast_plain_lift)
-            {
-                Pointer adjusted_coeff(allocate_uint(coeff_mod_count, pool));
-                if (plain[0] >= plain_upper_half_threshold_)
-                {
-                    Pointer decomposed_coeff(allocate_uint(coeff_mod_count, pool));
-                    add_uint_uint64(plain_upper_half_increment_.get(), plain[0], coeff_mod_count, adjusted_coeff.get());
-                    decompose_single_coeff(adjusted_coeff.get(), decomposed_coeff.get(), pool);
-
-                    for (int i = 0; i < encrypted_size; i++)
-                    {
-                        for (int j = 0; j < coeff_mod_count; j++)
-                        {
-                            multiply_poly_scalar_coeffmod(encrypted.data(i) + (j * coeff_count), coeff_count, 
-                                decomposed_coeff[j], coeff_modulus_[j], encrypted.data(i) + (j * coeff_count));
-                        }
-                    }
-                }
-                else
-                {
-                    for (int i = 0; i < encrypted_size; i++)
-                    {
-                        for (int j = 0; j < coeff_mod_count; j++)
-                        {
-                            multiply_poly_scalar_coeffmod(encrypted.data(i) + (j * coeff_count), coeff_count, 
-                                plain[0], coeff_modulus_[j], encrypted.data(i) + (j * coeff_count));
-                        }
-                    }
-                }
-                return;
-            }
-            else
-            {
-                // Need for lift plain coefficient in RNS form regarding to each qi
-                if (plain[0] >= plain_upper_half_threshold_)
-                {
-                    for (int i = 0; i < encrypted_size; i++)
-                    {
-                        for (int j = 0; j < coeff_mod_count; j++)
-                        {
-                            multiply_poly_scalar_coeffmod(encrypted.data(i) + (j * coeff_count), coeff_count, 
-                                plain[0] + plain_upper_half_increment_array_[j], coeff_modulus_[j], 
-                                encrypted.data(i) + (j * coeff_count));
-                        }
-                    }
-                }
-                // No need for lifting
-                else
-                {
-                    for (int i = 0; i < encrypted_size; i++)
-                    {
-                        for (int j = 0; j < coeff_mod_count; j++)
-                        {
-                            multiply_poly_scalar_coeffmod(encrypted.data(i) + (j * coeff_count), coeff_count,
-                                plain[0], coeff_modulus_[j], encrypted.data(i) + (j * coeff_count));
-                        }
-                    }
-                }
-                return;
-            }
-        }
-
-        // Generic plain case
-        Pointer adjusted_poly(allocate_zero_uint(coeff_count * coeff_mod_count, pool));
-        Pointer decomposed_poly(allocate_uint(coeff_count * coeff_mod_count, pool));
-        uint64_t *poly_to_transform = nullptr;
-        if (!qualifiers_.enable_fast_plain_lift)
-        {
-            // Reposition coefficients.
-            const uint64_t *plain_ptr = plain.data();
-            uint64_t *adjusted_poly_ptr = adjusted_poly.get();
-            for (int i = 0; i < plain_coeff_count; i++, plain_ptr++, adjusted_poly_ptr += coeff_mod_count)
-            {
-                if (*plain_ptr >= plain_upper_half_threshold_)
-                {
-                    add_uint_uint64(plain_upper_half_increment_.get(), *plain_ptr, coeff_mod_count,
-                        adjusted_poly_ptr);
-                }
-                else
-                {
-                    set_uint(*plain_ptr, coeff_mod_count, adjusted_poly_ptr);
-                }
-            }
-            decompose(adjusted_poly.get(), decomposed_poly.get(), pool);
-            poly_to_transform = decomposed_poly.get();
+            multiply_plain_ntt(encrypted, plain);
         }
         else
         {
-            for (int j = 0; j < coeff_mod_count; j++)
+            multiply_plain_normal(encrypted, plain, move(pool));
+        }
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
+    }
+
+    void Evaluator::multiply_plain_normal(Ciphertext &encrypted, const Plaintext &plain, MemoryPoolHandle pool)
+    {
+        // Extract encryption parameters.
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+
+        auto plain_upper_half_threshold = context_data.plain_upper_half_threshold();
+        auto plain_upper_half_increment = context_data.plain_upper_half_increment();
+        auto ntt_tables = context_data.small_ntt_tables();
+
+        size_t encrypted_size = encrypted.size();
+        size_t plain_coeff_count = plain.coeff_count();
+        size_t plain_nonzero_coeff_count = plain.nonzero_coeff_count();
+
+        // Size check
+        if (!product_fits_in(encrypted_size, coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        double new_scale = encrypted.scale() * plain.scale();
+
+        // Check that scale is positive and not too large
+        if (new_scale <= 0 || (static_cast<int>(log2(new_scale)) >= context_data.total_coeff_modulus_bit_count()))
+        {
+            throw invalid_argument("scale out of bounds");
+        }
+
+        // Set the scale
+        encrypted.scale() = new_scale;
+
+        /*
+        Optimizations for constant / monomial multiplication can lead to the presence of a timing side-channel in
+        use-cases where the plaintext data should also be kept private.
+        */
+        if (plain_nonzero_coeff_count == 1)
+        {
+            // Multiplying by a monomial?
+            size_t mono_exponent = plain.significant_coeff_count() - 1;
+
+            if (plain[mono_exponent] >= plain_upper_half_threshold)
             {
-                const uint64_t *plain_ptr = plain.data();
-                uint64_t *adjusted_poly_ptr = adjusted_poly.get() + (j * coeff_count);
-                uint64_t plain_upper_half_increment = plain_upper_half_increment_array_[j];
-                for (int i = 0; i < plain_coeff_count; i++, plain_ptr++, adjusted_poly_ptr++)
+                if (!context_data.qualifiers().using_fast_plain_lift)
                 {
-                    // Need to lift the coefficient in each qi
-                    if (*plain_ptr >= plain_upper_half_threshold_)
-                    {
-                        *adjusted_poly_ptr = *plain_ptr + plain_upper_half_increment;
-                    }
-                    // No need for lifting
-                    else
-                    {
-                        *adjusted_poly_ptr = *plain_ptr;
-                    }
+                    // Allocate temporary space for a single RNS coefficient
+                    SEAL_ALLOCATE_GET_COEFF_ITER(temp, coeff_modulus_size, pool);
+
+                    // We need to adjust the monomial modulo each coeff_modulus prime separately when the coeff_modulus
+                    // primes may be larger than the plain_modulus. We add plain_upper_half_increment (i.e., q-t) to
+                    // the monomial to ensure it is smaller than coeff_modulus and then do an RNS multiplication. Note
+                    // that in this case plain_upper_half_increment contains a multi-precision integer, so after the
+                    // addition we decompose the multi-precision integer into RNS components, and then multiply.
+                    add_uint(plain_upper_half_increment, coeff_modulus_size, plain[mono_exponent], temp);
+                    context_data.rns_tool()->base_q()->decompose(temp, pool);
+                    negacyclic_multiply_poly_mono_coeffmod(
+                        encrypted, encrypted_size, temp, mono_exponent, coeff_modulus, encrypted, pool);
+                }
+                else
+                {
+                    // Every coeff_modulus prime is larger than plain_modulus, so there is no need to adjust the
+                    // monomial. Instead, just do an RNS multiplication.
+                    negacyclic_multiply_poly_mono_coeffmod(
+                        encrypted, encrypted_size, plain[mono_exponent], mono_exponent, coeff_modulus, encrypted, pool);
                 }
             }
-            poly_to_transform = adjusted_poly.get();
-        }
-
-        // Need to multiply each component in encrypted with decomposed_poly (plain poly)
-        // Transform plain poly only once
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            ntt_negacyclic_harvey(poly_to_transform + (i * coeff_count), coeff_small_ntt_tables_[i]);
-        }
-
-        for (int i = 0; i < encrypted_size; i++)
-        {
-            uint64_t *encrypted_ptr = encrypted.data(i);
-            for (int j = 0; j < coeff_mod_count; j++, encrypted_ptr += coeff_count)
+            else
             {
-                // Explicit inline to avoid unnecessary copy
-                //ntt_multiply_poly_nttpoly(encrypted.data(i) + (j * coeff_count), poly_to_transform + (j * coeff_count),
-                //    coeff_small_ntt_tables_[j], encrypted.data(i) + (j * coeff_count), pool);
+                // The monomial represents a positive number, so no RNS multiplication is needed.
+                negacyclic_multiply_poly_mono_coeffmod(
+                    encrypted, encrypted_size, plain[mono_exponent], mono_exponent, coeff_modulus, encrypted, pool);
+            }
 
-                int coeff_count = coeff_small_ntt_tables_[j].coeff_count() + 1;
+            return;
+        }
 
+        // Generic case: any plaintext polynomial
+        // Allocate temporary space for an entire RNS polynomial
+        auto temp(allocate_zero_poly(coeff_count, coeff_modulus_size, pool));
+
+        if (!context_data.qualifiers().using_fast_plain_lift)
+        {
+            StrideIter<uint64_t *> temp_iter(temp.get(), coeff_modulus_size);
+
+            SEAL_ITERATE(iter(plain.data(), temp_iter), plain_coeff_count, [&](auto I) {
+                auto plain_value = get<0>(I);
+                if (plain_value >= plain_upper_half_threshold)
+                {
+                    add_uint(plain_upper_half_increment, coeff_modulus_size, plain_value, get<1>(I));
+                }
+                else
+                {
+                    *get<1>(I) = plain_value;
+                }
+            });
+
+            context_data.rns_tool()->base_q()->decompose_array(temp_iter, coeff_count, pool);
+        }
+        else
+        {
+            // Note that in this case plain_upper_half_increment holds its value in RNS form modulo the coeff_modulus
+            // primes.
+            RNSIter temp_iter(temp.get(), coeff_count);
+            SEAL_ITERATE(iter(temp_iter, plain_upper_half_increment), coeff_modulus_size, [&](auto I) {
+                SEAL_ITERATE(iter(get<0>(I), plain.data()), plain_coeff_count, [&](auto J) {
+                    get<0>(J) = get<1>(J) +
+                                (get<1>(I) &
+                                 static_cast<uint64_t>(-static_cast<int64_t>(get<1>(J) >= plain_upper_half_threshold)));
+                });
+            });
+        }
+
+        // Need to multiply each component in encrypted with temp; first step is to transform to NTT form
+        RNSIter temp_iter(temp.get(), coeff_count);
+        ntt_negacyclic_harvey(temp_iter, coeff_modulus_size, ntt_tables);
+
+        SEAL_ITERATE(iter(encrypted), encrypted_size, [&](auto I) {
+            SEAL_ITERATE(iter(I, temp_iter, coeff_modulus, ntt_tables), coeff_modulus_size, [&](auto J) {
                 // Lazy reduction
-                ntt_negacyclic_harvey_lazy(encrypted_ptr, coeff_small_ntt_tables_[j]);
-                dyadic_product_coeffmod(encrypted_ptr, poly_to_transform + (j * coeff_count),
-                    coeff_count, coeff_small_ntt_tables_[j].modulus(), encrypted_ptr);
-                inverse_ntt_negacyclic_harvey(encrypted_ptr, coeff_small_ntt_tables_[j]);
-            }
-        }
-    }
-
-    void Evaluator::transform_to_ntt(Plaintext &plain, const MemoryPoolHandle &pool)
-    {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int plain_coeff_count = plain.coeff_count();
-
-        // Verify parameters.
-        if (plain.coeff_count() > coeff_count)
-        {
-            throw invalid_argument("plain is not valid for encryption parameters");
-        }
-#ifdef SEAL_DEBUG
-        if (plain.significant_coeff_count() >= coeff_count || !are_poly_coefficients_less_than(plain.data(), 
-            plain.coeff_count(), 1, parms_.plain_modulus().data(), 1))
-        {
-            throw invalid_argument("plain is not valid for encryption parameters");
-        }
-#endif
-        if (!pool)
-        {
-            throw invalid_argument("pool is uninitialized");
-        }
-
-        // Resize to fit the entire NTT transformed (ciphertext size) polynomial
-        // Note that the new coefficients are automatically set to 0
-        plain.resize(coeff_count * coeff_mod_count);
-
-        // Verify if plain lift is needed
-        if (!qualifiers_.enable_fast_plain_lift)
-        {
-            Pointer adjusted_poly(allocate_zero_uint(coeff_count * coeff_mod_count, pool));
-            for (int i = 0; i < plain_coeff_count; i++)
-            {
-                if (plain[i] >= plain_upper_half_threshold_)
-                {
-                    add_uint_uint64(plain_upper_half_increment_.get(), plain[i], coeff_mod_count,
-                        adjusted_poly.get() + (i * coeff_mod_count));
-                }
-                else
-                {
-                    set_uint(plain[i], coeff_mod_count, adjusted_poly.get() + (i * coeff_mod_count));
-                }
-            }
-            decompose(adjusted_poly.get(), plain.data(), pool);
-        }
-        // No need for composed plain lift and decomposition
-        else
-        {
-            for (int j = coeff_mod_count - 1; j >= 0; j--)
-            {
-                const uint64_t *plain_ptr = plain.data();
-                uint64_t *adjusted_poly_ptr = plain.data() + (j * coeff_count);
-                uint64_t plain_upper_half_increment = plain_upper_half_increment_array_[j];
-                for (int i = 0; i < plain_coeff_count; i++, plain_ptr++, adjusted_poly_ptr++)
-                {
-                    // Need to lift the coefficient in each qi
-                    if (*plain_ptr >= plain_upper_half_threshold_)
-                    {
-                        *adjusted_poly_ptr = *plain_ptr + plain_upper_half_increment;
-                    }
-                    // No need for lifting
-                    else
-                    {
-                        *adjusted_poly_ptr = *plain_ptr;
-                    }
-                }
-            }
-        }
-
-        // Transform to NTT domain
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            ntt_negacyclic_harvey(plain.data() + (i * coeff_count), coeff_small_ntt_tables_[i]);
-        }
-    }
-
-    void Evaluator::transform_to_ntt(Ciphertext &encrypted)
-    {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int encrypted_size = encrypted.size();
-
-        // Verify parameters.
-        if (encrypted.hash_block_ != parms_.hash_block())
-        {
-            throw invalid_argument("encrypted is not valid for encryption parameters");
-        }
-
-        // Transform each polynomial to NTT domain
-        for (int i = 0; i < encrypted_size; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                ntt_negacyclic_harvey(encrypted.data(i) + (j * coeff_count), coeff_small_ntt_tables_[j]);
-            }
-        }
-    }
-
-    void Evaluator::transform_from_ntt(Ciphertext &encrypted_ntt)
-    {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int encrypted_ntt_size = encrypted_ntt.size();
-
-        // Verify parameters.
-        if (encrypted_ntt.hash_block_ != parms_.hash_block())
-        {
-            throw invalid_argument("encrypted_ntt is not valid for encryption parameters");
-        }
-
-        // Transform each polynomial from NTT domain
-        for (int i = 0; i < encrypted_ntt_size; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                inverse_ntt_negacyclic_harvey(encrypted_ntt.data(i) + (j * coeff_count), coeff_small_ntt_tables_[j]);
-            }
-        }
+                ntt_negacyclic_harvey_lazy(get<0>(J), get<3>(J));
+                dyadic_product_coeffmod(get<0>(J), get<1>(J), coeff_count, get<2>(J), get<0>(J));
+                inverse_ntt_negacyclic_harvey(get<0>(J), get<3>(J));
+            });
+        });
     }
 
     void Evaluator::multiply_plain_ntt(Ciphertext &encrypted_ntt, const Plaintext &plain_ntt)
     {
-        // Extract encryption parameters.
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int encrypted_size = encrypted_ntt.size();
-
         // Verify parameters.
-        if (encrypted_ntt.hash_block_ != parms_.hash_block())
+        if (!plain_ntt.is_ntt_form())
         {
-            throw invalid_argument("encrypted_ntt is not valid for encryption parameters");
+            throw invalid_argument("plain_ntt is not in NTT form");
         }
-        if (plain_ntt.coeff_count() != coeff_count * coeff_mod_count)
+        if (encrypted_ntt.parms_id() != plain_ntt.parms_id())
         {
-            throw invalid_argument("plain_ntt is not valid for encryption parameters");
+            throw invalid_argument("encrypted_ntt and plain_ntt parameter mismatch");
         }
-#ifdef SEAL_DEBUG
-        for (int i = 0; i < coeff_mod_count; i++)
+
+        // Extract encryption parameters.
+        auto &context_data = *context_->get_context_data(encrypted_ntt.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+        size_t encrypted_ntt_size = encrypted_ntt.size();
+
+        // Size check
+        if (!product_fits_in(encrypted_ntt_size, coeff_count, coeff_modulus_size))
         {
-            if (poly_infty_norm_coeffmod(plain_ntt.data(i * coeff_count), coeff_count, 
-                coeff_modulus_[i]) >= coeff_modulus_[i].value())
-            {
-                throw invalid_argument("plain_ntt is not valid for encryption parameters");
-            }
-            if (plain_ntt[coeff_count - 1 + (i * coeff_count)] != 0)
-            {
-                throw invalid_argument("plain_ntt is not valid for encryption parameters");
-            }
+            throw logic_error("invalid parameters");
         }
-#endif
-#ifdef SEAL_THROW_ON_MULTIPLY_PLAIN_BY_ZERO
-        if (plain_ntt.is_zero())
+
+        double new_scale = encrypted_ntt.scale() * plain_ntt.scale();
+
+        // Check that scale is positive and not too large
+        if (new_scale <= 0 || (static_cast<int>(log2(new_scale)) >= context_data.total_coeff_modulus_bit_count()))
         {
-            throw invalid_argument("plain_ntt cannot be zero");
+            throw invalid_argument("scale out of bounds");
         }
-#endif
-        for (int i = 0; i < encrypted_size; i++)
-        {
-            for (int j = 0; j < coeff_mod_count; j++)
-            {
-                dyadic_product_coeffmod(encrypted_ntt.data(i) + (j * coeff_count), plain_ntt.data() + (j * coeff_count),
-                    coeff_count - 1, coeff_modulus_[j], encrypted_ntt.data(i) + (j * coeff_count));
-            }
-        }
+
+        ConstRNSIter plain_ntt_iter(plain_ntt.data(), coeff_count);
+        SEAL_ITERATE(iter(encrypted_ntt), encrypted_ntt_size, [&](auto I) {
+            dyadic_product_coeffmod(I, plain_ntt_iter, coeff_modulus_size, coeff_modulus, I);
+        });
+
+        // Set the scale
+        encrypted_ntt.scale() = new_scale;
     }
 
-    void Evaluator::apply_galois(Ciphertext &encrypted, uint64_t galois_elt, const GaloisKeys &galois_keys, const MemoryPoolHandle &pool)
+    void Evaluator::transform_to_ntt_inplace(Plaintext &plain, parms_id_type parms_id, MemoryPoolHandle pool)
     {
-        // Extract paramters
-        int coeff_count = parms_.poly_modulus().coeff_count();
-        int coeff_mod_count = static_cast<int>(coeff_modulus_.size());
-        int encrypted_size = encrypted.size();
+        // Verify parameters.
+        if (!is_valid_for(plain, context_))
+        {
+            throw invalid_argument("plain is not valid for encryption parameters");
+        }
 
-        // Verify parameters
-        if (!(galois_elt & 1) || (galois_elt >= 2 * static_cast<uint64_t>(coeff_count) - 1))
+        auto context_data_ptr = context_->get_context_data(parms_id);
+        if (!context_data_ptr)
         {
-            throw invalid_argument("galois element is not valid");
+            throw invalid_argument("parms_id is not valid for the current context");
         }
-        if (encrypted.hash_block_ != parms_.hash_block())
+        if (plain.is_ntt_form())
         {
-            throw invalid_argument("encrypted is not valid for encryption parameters");
-        }
-        if (galois_keys.hash_block_ != parms_.hash_block())
-        {
-            throw invalid_argument("galois_keys is not valid for encryption parameters");
-        }
-        if (encrypted_size > 2)
-        {
-            throw invalid_argument("ciphertext size must be 2");
+            throw invalid_argument("plain is already in NTT form");
         }
         if (!pool)
         {
             throw invalid_argument("pool is uninitialized");
         }
 
-        int n = coeff_count - 1;
-        int m = n << 1;
-        int subgroup_size = n >> 1;
-        int n_power_of_two = get_power_of_two(n);
+        // Extract encryption parameters.
+        auto &context_data = *context_data_ptr;
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+        size_t plain_coeff_count = plain.coeff_count();
 
-        // Check if Galois key is generated or not.
-        // If not, attempt a bit decomposition; maybe we have log(n) many keys
-        if (!galois_keys.has_key(galois_elt))
+        auto plain_upper_half_threshold = context_data.plain_upper_half_threshold();
+        auto plain_upper_half_increment = context_data.plain_upper_half_increment();
+
+        auto coeff_modulus_ntt_tables = context_data.small_ntt_tables();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
         {
-            // galois_elt = 3^order1 * (-1)^order2
-            uint64_t order1 = Zmstar_to_generator_.at(galois_elt).first;
-            uint64_t order2 = Zmstar_to_generator_.at(galois_elt).second;
+            throw logic_error("invalid parameters");
+        }
 
-            // We use either 3 or -3 as our generator, depending on which gives smaller HW
-            uint64_t two_power_of_gen = 3;
+        // Resize to fit the entire NTT transformed (ciphertext size) polynomial
+        // Note that the new coefficients are automatically set to 0
+        plain.resize(coeff_count * coeff_modulus_size);
+        RNSIter plain_iter(plain.data(), coeff_count);
 
-            // Does order1 or n/2-order1 have smaller Hamming weight?
-            if (hamming_weight(subgroup_size - order1) < hamming_weight(order1))
-            {
-                order1 = subgroup_size - order1;
-                try_mod_inverse(3, m, two_power_of_gen);
-            }
+        if (!context_data.qualifiers().using_fast_plain_lift)
+        {
+            // Allocate temporary space for an entire RNS polynomial
+            // Slight semantic misuse of RNSIter here, but this works well
+            SEAL_ALLOCATE_ZERO_GET_RNS_ITER(temp, coeff_modulus_size, coeff_count, pool);
 
-            while(order1)
-            {
-                if (order1 & 1)
+            SEAL_ITERATE(iter(plain.data(), temp), plain_coeff_count, [&](auto I) {
+                auto plain_value = get<0>(I);
+                if (plain_value >= plain_upper_half_threshold)
                 {
-                    if (!galois_keys.has_key(two_power_of_gen))
-                    {
-                        throw invalid_argument("galois key not present");
-                    }
-                    apply_galois(encrypted, two_power_of_gen, galois_keys, pool);
+                    add_uint(plain_upper_half_increment, coeff_modulus_size, plain_value, get<1>(I));
                 }
-                two_power_of_gen *= two_power_of_gen;
-                two_power_of_gen &= (m - 1);
-                order1 >>= 1;
-            }
-            if (order2)
-            {
-                if (!galois_keys.has_key(m - 1))
+                else
                 {
-                    throw invalid_argument("galois key not present");
+                    *get<1>(I) = plain_value;
                 }
-                apply_galois(encrypted, m - 1, galois_keys, pool);
-            }
-            return;
-        }
+            });
 
-        // Apply Galois for each ciphertext
-        Pointer temp0(allocate_zero_uint(coeff_count * coeff_mod_count, pool));
-        for (int i = 0; i < coeff_mod_count; i++)
+            context_data.rns_tool()->base_q()->decompose_array(temp, coeff_count, pool);
+
+            // Copy data back to plain
+            set_poly(temp, coeff_count, coeff_modulus_size, plain.data());
+        }
+        else
         {
-            util::apply_galois(encrypted.data() + (i * coeff_count), n_power_of_two,
-                galois_elt, coeff_modulus_[i], temp0.get() + (i * coeff_count));
-        }
-        Pointer temp1(allocate_zero_uint(coeff_count * coeff_mod_count, pool));
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            util::apply_galois(encrypted.data(1) + (i * coeff_count), n_power_of_two,
-                galois_elt, coeff_modulus_[i], temp1.get() + (i * coeff_count));
-        }
+            // Note that in this case plain_upper_half_increment holds its value in RNS form modulo the coeff_modulus
+            // primes.
 
-        // Calculate (temp1 * galois_key.first, temp1 * galois_key.second) + (temp0, 0)
-        const uint64_t *encrypted_coeff = temp1.get();
-        Pointer encrypted_coeff_prod_inv_coeff(allocate_uint(coeff_count, pool));
+            // Create a "reversed" helper iterator that iterates in the reverse order both plain RNS components and
+            // the plain_upper_half_increment values.
+            auto helper_iter = reverse_iter(plain_iter, plain_upper_half_increment);
+            advance(helper_iter, -safe_cast<ptrdiff_t>(coeff_modulus_size - 1));
 
-        // decompose encrypted_array[count-1] into base w
-        // want to create an array of polys, each of whose components i is (encrypted_array[count-1])^(i) - in the notation of FV paper
-        // This allocation stores one of the decomposed factors modulo one of the primes
-        Pointer decomp_encrypted_last(allocate_uint(coeff_count, pool));
-
-        // Lazy reduction
-        Pointer wide_innerresult0(allocate_zero_poly(coeff_count, 2 * coeff_mod_count, pool));
-        Pointer wide_innerresult1(allocate_zero_poly(coeff_count, 2 * coeff_mod_count, pool));
-        Pointer innerresult(allocate_poly(coeff_count, coeff_mod_count, pool));
-        Pointer temp_decomp_coeff(allocate_uint(coeff_count, pool));
-
-        /*
-        For lazy reduction to work here, we need to ensure that the 128-bit accumulators (wide_innerresult0 and wide_innerresult1)
-        do not overflow. Since the modulus primes are at most 60 bits, if the total number of summands is K, then the size of the
-        total sum of products (without reduction) is at most 62 + 60 + bit_length(K). We need this to be at most 128, thus we need
-        bit_length(K) <= 6. Thus, we need K <= 63. In this case, this means sum_i galois_keys.key(galois_elt)[i].size() / 2 <= 63.
-        */
-        for (int i = 0; i < coeff_mod_count; i++)
-        {
-            multiply_poly_scalar_coeffmod(encrypted_coeff + (i * coeff_count), coeff_count, 
-                inv_coeff_products_mod_coeff_array_[i], coeff_modulus_[i], encrypted_coeff_prod_inv_coeff.get());
-
-            int shift = 0;
-            const Ciphertext &key_component_ref = galois_keys.key(galois_elt)[i];
-            int keys_size = key_component_ref.size();
-            for (int k = 0; k < keys_size; k += 2)
-            {
-                const uint64_t *key_ptr_0 = key_component_ref.data(k);
-                const uint64_t *key_ptr_1 = key_component_ref.data(k + 1);
-
-                // Decompose here
-                int decomposition_bit_count = galois_keys.decomposition_bit_count();
-                for (int coeff_index = 0; coeff_index < coeff_count; coeff_index++)
-                {
-                    decomp_encrypted_last[coeff_index] = encrypted_coeff_prod_inv_coeff[coeff_index] >> shift;
-                    decomp_encrypted_last[coeff_index] &= (1ULL << decomposition_bit_count) - 1;
-                }
-
-                uint64_t *wide_innerresult0_ptr = wide_innerresult0.get();
-                uint64_t *wide_innerresult1_ptr = wide_innerresult1.get();
-                for (int j = 0; j < coeff_mod_count; j++)
-                {
-                    uint64_t *temp_decomp_coeff_ptr = temp_decomp_coeff.get();
-                    set_uint_uint(decomp_encrypted_last.get(), coeff_count, temp_decomp_coeff_ptr);
-
-                    // We don't reduce here, so might get up to two extra bits. Thus 62 bits at most.
-                    ntt_negacyclic_harvey_lazy(temp_decomp_coeff_ptr, coeff_small_ntt_tables_[j]);
-
-                    // Lazy reduction
-                    uint64_t wide_innerproduct[2];
-                    for (int m = 0; m < coeff_count; m++, wide_innerresult0_ptr += 2)
-                    {
-                        multiply_uint64(*temp_decomp_coeff_ptr++, *key_ptr_0++, wide_innerproduct);
-                        unsigned char carry = add_uint64(wide_innerresult0_ptr[0], wide_innerproduct[0], 0,
-                            wide_innerresult0_ptr);
-                        wide_innerresult0_ptr[1] += wide_innerproduct[1] + carry;
-                    }
-
-                    temp_decomp_coeff_ptr = temp_decomp_coeff.get();
-                    for (int m = 0; m < coeff_count; m++, wide_innerresult1_ptr += 2)
-                    {
-                        multiply_uint64(*temp_decomp_coeff_ptr++, *key_ptr_1++, wide_innerproduct);
-                        unsigned char carry = add_uint64(wide_innerresult1_ptr[0], wide_innerproduct[0], 0,
-                            wide_innerresult1_ptr);
-                        wide_innerresult1_ptr[1] += wide_innerproduct[1] + carry;
-                    }
-                }
-                shift += decomposition_bit_count;
-            }
+            SEAL_ITERATE(helper_iter, coeff_modulus_size, [&](auto I) {
+                SEAL_ITERATE(iter(*plain_iter, get<0>(I)), plain_coeff_count, [&](auto J) {
+                    get<1>(J) = get<0>(J) +
+                                (get<1>(I) &
+                                 static_cast<uint64_t>(-static_cast<int64_t>(get<0>(J) >= plain_upper_half_threshold)));
+                });
+            });
         }
 
-        uint64_t *temp_ptr = temp0.get();
-        uint64_t *innerresult_poly_ptr = innerresult.get();
-        uint64_t *wide_innerresult_poly_ptr = wide_innerresult0.get();
-        uint64_t *encrypted_ptr = encrypted.data();
-        uint64_t *innerresult_coeff_ptr = innerresult_poly_ptr;
-        uint64_t *wide_innerresult_coeff_ptr = wide_innerresult_poly_ptr;
-        for (int i = 0; i < coeff_mod_count; i++, innerresult_poly_ptr += coeff_count,
-            wide_innerresult_poly_ptr += 2 * coeff_count, encrypted_ptr += coeff_count,
-            temp_ptr += coeff_count)
-        {
-            for (int m = 0; m < coeff_count; m++, wide_innerresult_coeff_ptr += 2)
-            {
-                *innerresult_coeff_ptr++ = barrett_reduce_128(wide_innerresult_coeff_ptr, coeff_modulus_[i]);
-            }
-            inverse_ntt_negacyclic_harvey(innerresult_poly_ptr, coeff_small_ntt_tables_[i]);
-            add_poly_poly_coeffmod(temp_ptr, innerresult_poly_ptr, coeff_count,
-                coeff_modulus_[i], encrypted_ptr);
-        }
+        // Transform to NTT domain
+        ntt_negacyclic_harvey(plain_iter, coeff_modulus_size, coeff_modulus_ntt_tables);
 
-        innerresult_poly_ptr = innerresult.get();
-        wide_innerresult_poly_ptr = wide_innerresult1.get();
-        encrypted_ptr = encrypted.data(1);
-        wide_innerresult_coeff_ptr = wide_innerresult_poly_ptr;
-        for (int i = 0; i < coeff_mod_count; i++, innerresult_poly_ptr += coeff_count,
-            wide_innerresult_poly_ptr += 2 * coeff_count, encrypted_ptr += coeff_count)
-        {
-            innerresult_coeff_ptr = encrypted_ptr;
-            for (int m = 0; m < coeff_count; m++, wide_innerresult_coeff_ptr += 2)
-            {
-                *innerresult_coeff_ptr++ = barrett_reduce_128(wide_innerresult_coeff_ptr, coeff_modulus_[i]);
-            }
-            inverse_ntt_negacyclic_harvey(encrypted_ptr, coeff_small_ntt_tables_[i]);
-        }
+        plain.parms_id() = parms_id;
     }
 
-    void Evaluator::rotate_rows(Ciphertext &encrypted, int steps, const GaloisKeys &galois_keys, const MemoryPoolHandle &pool)
+    void Evaluator::transform_to_ntt_inplace(Ciphertext &encrypted)
     {
-        if (!qualifiers_.enable_batching)
+        // Verify parameters.
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+
+        auto context_data_ptr = context_->get_context_data(encrypted.parms_id());
+        if (!context_data_ptr)
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+        if (encrypted.is_ntt_form())
+        {
+            throw invalid_argument("encrypted is already in NTT form");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_data_ptr;
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+        size_t encrypted_size = encrypted.size();
+
+        auto coeff_modulus_ntt_tables = context_data.small_ntt_tables();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // Transform each polynomial to NTT domain
+        ntt_negacyclic_harvey(encrypted, encrypted_size, coeff_modulus_ntt_tables);
+
+        // Finally change the is_ntt_transformed flag
+        encrypted.is_ntt_form() = true;
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
+    }
+
+    void Evaluator::transform_from_ntt_inplace(Ciphertext &encrypted_ntt)
+    {
+        // Verify parameters.
+        if (!is_metadata_valid_for(encrypted_ntt, context_) || !is_buffer_valid(encrypted_ntt))
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+
+        auto context_data_ptr = context_->get_context_data(encrypted_ntt.parms_id());
+        if (!context_data_ptr)
+        {
+            throw invalid_argument("encrypted_ntt is not valid for encryption parameters");
+        }
+        if (!encrypted_ntt.is_ntt_form())
+        {
+            throw invalid_argument("encrypted_ntt is not in NTT form");
+        }
+
+        // Extract encryption parameters.
+        auto &context_data = *context_data_ptr;
+        auto &parms = context_data.parms();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = parms.coeff_modulus().size();
+        size_t encrypted_ntt_size = encrypted_ntt.size();
+
+        auto coeff_modulus_ntt_tables = context_data.small_ntt_tables();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // Transform each polynomial from NTT domain
+        inverse_ntt_negacyclic_harvey(encrypted_ntt, encrypted_ntt_size, coeff_modulus_ntt_tables);
+
+        // Finally change the is_ntt_transformed flag
+        encrypted_ntt.is_ntt_form() = false;
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted_ntt.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
+    }
+
+    void Evaluator::apply_galois_inplace(
+        Ciphertext &encrypted, uint32_t galois_elt, const GaloisKeys &galois_keys, MemoryPoolHandle pool)
+    {
+        // Verify parameters.
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+
+        // Don't validate all of galois_keys but just check the parms_id.
+        if (galois_keys.parms_id() != context_->key_parms_id())
+        {
+            throw invalid_argument("galois_keys is not valid for encryption parameters");
+        }
+
+        auto &context_data = *context_->get_context_data(encrypted.parms_id());
+        auto &parms = context_data.parms();
+        auto &coeff_modulus = parms.coeff_modulus();
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t coeff_modulus_size = coeff_modulus.size();
+        size_t encrypted_size = encrypted.size();
+        // Use key_context_data where permutation tables exist since previous runs.
+        auto galois_tool = context_->key_context_data()->galois_tool();
+
+        // Size check
+        if (!product_fits_in(coeff_count, coeff_modulus_size))
+        {
+            throw logic_error("invalid parameters");
+        }
+
+        // Check if Galois key is generated or not.
+        if (!galois_keys.has_key(galois_elt))
+        {
+            throw invalid_argument("Galois key not present");
+        }
+
+        uint64_t m = mul_safe(static_cast<uint64_t>(coeff_count), uint64_t(2));
+
+        // Verify parameters
+        if (!(galois_elt & 1) || unsigned_geq(galois_elt, m))
+        {
+            throw invalid_argument("Galois element is not valid");
+        }
+        if (encrypted_size > 2)
+        {
+            throw invalid_argument("encrypted size must be 2");
+        }
+
+        SEAL_ALLOCATE_GET_RNS_ITER(temp, coeff_count, coeff_modulus_size, pool);
+
+        // DO NOT CHANGE EXECUTION ORDER OF FOLLOWING SECTION
+        // BEGIN: Apply Galois for each ciphertext
+        // Execution order is sensitive, since apply_galois is not inplace!
+        if (parms.scheme() == scheme_type::BFV)
+        {
+            // !!! DO NOT CHANGE EXECUTION ORDER!!!
+
+            // First transform encrypted.data(0)
+            auto encrypted_iter = iter(encrypted);
+            galois_tool->apply_galois(encrypted_iter[0], coeff_modulus_size, galois_elt, coeff_modulus, temp);
+
+            // Copy result to encrypted.data(0)
+            set_poly(temp, coeff_count, coeff_modulus_size, encrypted.data(0));
+
+            // Next transform encrypted.data(1)
+            galois_tool->apply_galois(encrypted_iter[1], coeff_modulus_size, galois_elt, coeff_modulus, temp);
+        }
+        else if (parms.scheme() == scheme_type::CKKS)
+        {
+            // !!! DO NOT CHANGE EXECUTION ORDER!!!
+
+            // First transform encrypted.data(0)
+            auto encrypted_iter = iter(encrypted);
+            galois_tool->apply_galois_ntt(encrypted_iter[0], coeff_modulus_size, galois_elt, temp);
+
+            // Copy result to encrypted.data(0)
+            set_poly(temp, coeff_count, coeff_modulus_size, encrypted.data(0));
+
+            // Next transform encrypted.data(1)
+            galois_tool->apply_galois_ntt(encrypted_iter[1], coeff_modulus_size, galois_elt, temp);
+        }
+        else
+        {
+            throw logic_error("scheme not implemented");
+        }
+
+        // Wipe encrypted.data(1)
+        set_zero_poly(coeff_count, coeff_modulus_size, encrypted.data(1));
+
+        // END: Apply Galois for each ciphertext
+        // REORDERING IS SAFE NOW
+
+        // Calculate (temp * galois_key[0], temp * galois_key[1]) + (ct[0], 0)
+        switch_key_inplace(
+            encrypted, temp, static_cast<const KSwitchKeys &>(galois_keys), GaloisKeys::get_index(galois_elt), pool);
+#ifdef SEAL_THROW_ON_TRANSPARENT_CIPHERTEXT
+        // Transparent ciphertext output is not allowed.
+        if (encrypted.is_transparent())
+        {
+            throw logic_error("result ciphertext is transparent");
+        }
+#endif
+    }
+
+    void Evaluator::rotate_internal(
+        Ciphertext &encrypted, int steps, const GaloisKeys &galois_keys, MemoryPoolHandle pool)
+    {
+        auto context_data_ptr = context_->get_context_data(encrypted.parms_id());
+        if (!context_data_ptr)
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+        if (!context_data_ptr->qualifiers().using_batching)
         {
             throw logic_error("encryption parameters do not support batching");
+        }
+        if (galois_keys.parms_id() != context_->key_parms_id())
+        {
+            throw invalid_argument("galois_keys is not valid for encryption parameters");
         }
 
         // Is there anything to do?
@@ -1798,449 +1959,285 @@ namespace seal
             return;
         }
 
-        // Extract sign of steps. When steps is positive, the rotation is to the left,
-        // and when steps is negative, it is to the right.
-        bool sign = steps < 0;
-        uint32_t pos_steps = abs(steps);
-        uint32_t n = parms_.poly_modulus().coeff_count() - 1;
-        uint32_t m_power_of_two = get_power_of_two(n) + 1;
+        size_t coeff_count = context_data_ptr->parms().poly_modulus_degree();
+        auto galois_tool = context_data_ptr->galois_tool();
 
-        if (pos_steps >= (n >> 1))
+        // Check if Galois key is generated or not.
+        if (galois_keys.has_key(galois_tool->get_elt_from_step(steps)))
         {
-            throw invalid_argument("step count too large");
-        }
-
-        pos_steps &= (1UL << m_power_of_two) - 1;
-        if (sign)
-        {
-            steps = (n >> 1) - pos_steps;
+            // Perform rotation and key switching
+            apply_galois_inplace(encrypted, galois_tool->get_elt_from_step(steps), galois_keys, move(pool));
         }
         else
         {
-            steps = pos_steps;
-        }
+            // Convert the steps to NAF: guarantees using smallest HW
+            vector<int> naf_steps = naf(steps);
 
-        // Construct Galois element for row rotation
-        int gen = 3;
-        uint64_t galois_elt = 1;
-        for (int i = 0; i < steps; i++)
-        {
-            galois_elt *= gen;
-            galois_elt &= (1ULL << m_power_of_two) - 1;
-        }
+            // If naf_steps contains only one element, then this is a power-of-two
+            // rotation and we would have expected not to get to this part of the
+            // if-statement.
+            if (naf_steps.size() == 1)
+            {
+                throw invalid_argument("Galois key not present");
+            }
 
-        // Perform rotation and key switching
-        apply_galois(encrypted, galois_elt, galois_keys, pool);
+            SEAL_ITERATE(naf_steps.cbegin(), naf_steps.size(), [&](auto step) {
+                // We might have a NAF-term of size coeff_count / 2; this corresponds
+                // to no rotation so we skip it. Otherwise call rotate_internal.
+                if (safe_cast<size_t>(abs(step)) != (coeff_count >> 1))
+                {
+                    // Apply rotation for this step
+                    this->rotate_internal(encrypted, step, galois_keys, pool);
+                }
+            });
+        }
     }
 
-    //void Evaluator::polynomial_evaluation(const Ciphertext &encrypted, vector<uint64_t> &coeff, const EvaluationKeys &evaluation_keys, const SmallModulus &eval_plain_modulus, Ciphertext &destination)
-    //{
-    //    // Save original parameters for recover at the end of this algorithm
-    //    EncryptionParameters origin_parms_(parms_);
+    void Evaluator::switch_key_inplace(
+        Ciphertext &encrypted, ConstRNSIter target_iter, const KSwitchKeys &kswitch_keys, size_t kswitch_keys_index,
+        MemoryPoolHandle pool)
+    {
+        auto parms_id = encrypted.parms_id();
+        auto &context_data = *context_->get_context_data(parms_id);
+        auto &parms = context_data.parms();
+        auto &key_context_data = *context_->key_context_data();
+        auto &key_parms = key_context_data.parms();
+        auto scheme = parms.scheme();
 
-    //    // Temporarily change the plain_modulus to eval_plain_modulus
-    //    parms_.set_plain_modulus(eval_plain_modulus);
-    //    Ciphertext encrypted_copy(encrypted);
-    //    encrypted_copy.hash_block_ = parms_.hash_block();
+        // Verify parameters.
+        if (!is_metadata_valid_for(encrypted, context_) || !is_buffer_valid(encrypted))
+        {
+            throw invalid_argument("encrypted is not valid for encryption parameters");
+        }
+        if (!target_iter)
+        {
+            throw invalid_argument("target_iter");
+        }
+        if (!context_->using_keyswitching())
+        {
+            throw logic_error("keyswitching is not supported by the context");
+        }
 
-    //    int degree = coeff.size() - 1;
+        // Don't validate all of kswitch_keys but just check the parms_id.
+        if (kswitch_keys.parms_id() != context_->key_parms_id())
+        {
+            throw invalid_argument("parameter mismatch");
+        }
 
-    //    // Compute parameter k = sqrt(degree/2), m = smallest interger with degree_prime = k * (2^m - 1) > degree
-    //    int k = optimal_parameter_paterson(degree);
-    //    int degree_prime;
-    //    int m = 1;
-    //    while (1)
-    //    {
-    //        degree_prime = (exponentiate_uint64(2, m) - 1) * k;
-    //        if (degree_prime > degree)
-    //        {
-    //            break;
-    //        }
-    //        else
-    //        {
-    //            m++;
-    //        }
-    //    }
+        if (kswitch_keys_index >= kswitch_keys.data().size())
+        {
+            throw out_of_range("kswitch_keys_index");
+        }
+        if (!pool)
+        {
+            throw invalid_argument("pool is uninitialized");
+        }
+        if (scheme == scheme_type::BFV && encrypted.is_ntt_form())
+        {
+            throw invalid_argument("BFV encrypted cannot be in NTT form");
+        }
+        if (scheme == scheme_type::CKKS && !encrypted.is_ntt_form())
+        {
+            throw invalid_argument("CKKS encrypted must be in NTT form");
+        }
 
-    //    // If degree is low just compute all power and dot product
-    //    int number_of_nonscalar_mult = (k - 1) + 2 * (m - 1) + (1 << (m - 1)) - 1;
-    //    if (degree < number_of_nonscalar_mult || degree < 3) 
-    //    {
-    //        vector<Ciphertext> power_of_all(degree + 1);
-    //        compute_all_powers(encrypted_copy, degree, evaluation_keys, power_of_all);
-    //        polynomial_evaluation(power_of_all, coeff, evaluation_keys, destination);
+        // Extract encryption parameters.
+        size_t coeff_count = parms.poly_modulus_degree();
+        size_t decomp_modulus_size = parms.coeff_modulus().size();
+        auto &key_modulus = key_parms.coeff_modulus();
+        size_t key_modulus_size = key_modulus.size();
+        size_t rns_modulus_size = decomp_modulus_size + 1;
+        auto key_ntt_tables = key_context_data.small_ntt_tables();
+        auto modswitch_factors = key_context_data.rns_tool()->inv_q_last_mod_q();
 
-    //        // Go back to original parms_
-    //        parms_ = origin_parms_;
-    //        destination.hash_block_ = parms_.hash_block();
-    //        return;
-    //    }
+        // Size check
+        if (!product_fits_in(coeff_count, rns_modulus_size, size_t(2)))
+        {
+            throw logic_error("invalid parameters");
+        }
 
-    //    // Compute encryption of baby step (1, msg, msg^2, ... , msg^k)
-    //    vector<Ciphertext> baby_step(k + 1);
-    //    compute_all_powers(encrypted_copy, k, evaluation_keys, baby_step);
+        // Prepare input
+        auto &key_vector = kswitch_keys.data()[kswitch_keys_index];
+        size_t key_component_count = key_vector[0].data().size();
 
-    //    // Compute encryption of giant step (msg^(2k), ... , msg^(2^{m-1}k))
-    //    vector<Ciphertext> giant_step(m - 1);
-    //    square(baby_step[k], giant_step[0]);
-    //    relinearize(giant_step[0], evaluation_keys);
-    //    for (int i = 0; i < m - 2; i++)
-    //    {
-    //        square(giant_step[i], giant_step[i + 1]);
-    //        relinearize(giant_step[i + 1], evaluation_keys);
-    //    }
+        // Check only the used component in KSwitchKeys.
+        for (auto &each_key : key_vector)
+        {
+            if (!is_metadata_valid_for(each_key, context_) || !is_buffer_valid(each_key))
+            {
+                throw invalid_argument("kswitch_keys is not valid for encryption parameters");
+            }
+        }
 
-    //    // Set f'(x) = X^degree_prime + f(x)
-    //    vector<uint64_t> f_prime(degree_prime + 1);
-    //    for (int i = 0; i < degree_prime + 1; i++)
-    //    {
-    //        if (i < coeff.size())
-    //        {
-    //            f_prime[i] = coeff[i];
-    //        }
-    //        else if (i < degree_prime)
-    //        {
-    //            f_prime[i] = 0;
-    //        }
-    //    }
-    //    f_prime[degree_prime] = 1;
+        // Create a copy of target_iter
+        SEAL_ALLOCATE_GET_RNS_ITER(t_target, coeff_count, decomp_modulus_size, pool);
+        set_uint(target_iter, decomp_modulus_size * coeff_count, t_target);
 
-    //    //Evaluate f_prime
-    //    Ciphertext encrypted_f_prime(parms_);
-    //    paterson_stockmeyer(baby_step, giant_step, encrypted_copy, f_prime, evaluation_keys, encrypted_f_prime, k, m);
+        // In CKKS t_target is in NTT form; switch back to normal form
+        if (scheme == scheme_type::CKKS)
+        {
+            inverse_ntt_negacyclic_harvey(t_target, decomp_modulus_size, key_ntt_tables);
+        }
 
-    //    //Compute encryption of X^degree_prime = X^k * X^2k ... X^{2^{m-1}k}
-    //    Ciphertext power_of_degree_prime(parms_);
-    //    multiply(baby_step[k], giant_step[0], power_of_degree_prime);
-    //    relinearize(power_of_degree_prime, evaluation_keys);
-    //    for (int i = 0; i < m - 2; i++)
-    //    {
-    //        multiply(power_of_degree_prime, giant_step[i + 1], power_of_degree_prime);
-    //        relinearize(power_of_degree_prime, evaluation_keys);
-    //    }
+        // Temporary result
+        auto t_poly_prod(allocate_zero_poly_array(key_component_count, coeff_count, rns_modulus_size, pool));
 
-    //    //Substract X^degree_prime from temp
-    //    sub(encrypted_f_prime, power_of_degree_prime, destination);
+        SEAL_ITERATE(iter(size_t(0)), rns_modulus_size, [&](auto I) {
+            size_t key_index = (I == decomp_modulus_size ? key_modulus_size - 1 : I);
 
-    //    // Go back to original parms_
-    //    parms_ = origin_parms_;
-    //    destination.hash_block_ = parms_.hash_block();
-    //}
+            // Product of two numbers is up to 60 + 60 = 120 bits, so we can sum up to 256 of them without reduction.
+            size_t lazy_reduction_summand_bound = size_t(SEAL_MULTIPLY_ACCUMULATE_USER_MOD_MAX);
+            size_t lazy_reduction_counter = lazy_reduction_summand_bound;
 
-    //void Evaluator::digit_extraction(Ciphertext &encrypted, const EvaluationKeys &evaluation_keys, vector<Ciphertext> &destination, long p, long e, long r)
-    //{
-    //    if (e < 2)
-    //    {
-    //        throw invalid_argument("e must be at least 2");
-    //    }
+            // Allocate memory for a lazy accumulator (128-bit coefficients)
+            auto t_poly_lazy(allocate_zero_poly_array(key_component_count, coeff_count, 2, pool));
 
-    //    //Extract encryption parameters.
-    //    int coeff_count = parms_.poly_modulus().coeff_count();
-    //    int coeff_mod_count = parms_.coeff_modulus().size();
-    //    int encrypted_size = encrypted.size();
+            // Semantic misuse of PolyIter; this is really pointing to the data for a single RNS factor
+            PolyIter accumulator_iter(t_poly_lazy.get(), 2, coeff_count);
 
-    //    //Find k such that p^k > (e-1)(p-1)+1
-    //    long k = 1;
-    //    long pow_of_p = 1;
-    //    while (1)
-    //    {
-    //        pow_of_p *= p;
-    //        if (pow_of_p < (e - 1)*(p - 1) + 1)
-    //        {
-    //            k++;
-    //        }
-    //        else
-    //        {
-    //            break;
-    //        }
-    //    }
+            // Multiply with keys and perform lazy reduction on product's coefficients
+            SEAL_ITERATE(iter(size_t(0)), decomp_modulus_size, [&](auto J) {
+                SEAL_ALLOCATE_GET_COEFF_ITER(t_ntt, coeff_count, pool);
+                ConstCoeffIter t_operand;
 
-    //    //Initialize destination
-    //    destination.resize(r);
-    //    for (int i = 0; i < r; i++)
-    //    {
-    //        destination[i].resize(parms_, encrypted_size);
-    //    }
+                // RNS-NTT form exists in input
+                if ((scheme == scheme_type::CKKS) && (I == J))
+                {
+                    t_operand = target_iter[J];
+                }
+                // Perform RNS-NTT conversion
+                else
+                {
+                    // No need to perform RNS conversion (modular reduction)
+                    if (key_modulus[J] <= key_modulus[key_index])
+                    {
+                        set_uint(t_target[J], coeff_count, t_ntt);
+                    }
+                    // Perform RNS conversion (modular reduction)
+                    else
+                    {
+                        modulo_poly_coeffs(t_target[J], coeff_count, key_modulus[key_index], t_ntt);
+                    }
+                    // NTT conversion lazy outputs in [0, 4q)
+                    ntt_negacyclic_harvey_lazy(t_ntt, key_ntt_tables[key_index]);
+                    t_operand = t_ntt;
+                }
 
-    //    //lift[i] = poly_lift(3, i+1) which makes x + O(3^{i+1}) to x + O(3^{i+2})
-    //    vector<vector<uint64_t> > lift(r - 1);
-    //    for (int i = 0; i < r - 1; i++) 
-    //    {
-    //        lift[i].resize(p + 1);
-    //        lift[i] = compute_lift_uint64(p, i + 1);
-    //    }
+                // Multiply with keys and modular accumulate products in a lazy fashion
+                SEAL_ITERATE(iter(key_vector[J].data(), accumulator_iter), key_component_count, [&](auto K) {
+                    if (!lazy_reduction_counter)
+                    {
+                        SEAL_ITERATE(iter(t_operand, get<0>(K)[key_index], get<1>(K)), coeff_count, [&](auto L) {
+                            unsigned long long qword[2]{ 0, 0 };
+                            multiply_uint64(get<0>(L), get<1>(L), qword);
 
-    //    //remainlsd[i](x) = [x]_3 in mod 3^{i+2}
-    //    vector<vector<uint64_t> > remainlsd;
-    //    remainlsd.resize(e - 1);
-    //    for (int i = 0; i < e - 1; i++) 
-    //    {
-    //        int degree = (i + 1)*(p - 1) + 1;
-    //        remainlsd[i].resize(degree + 1);
-    //        if (i >= (e - r - 1)) remainlsd[i] = compute_remainlsd_uint64(p, i + 2);
-    //    }
+                            // Accumulate product of t_operand and t_key_acc to t_poly_lazy and reduce
+                            add_uint128(qword, get<2>(L).ptr(), qword);
+                            get<2>(L)[0] = barrett_reduce_128(qword, key_modulus[key_index]);
+                            get<2>(L)[1] = 0;
+                        });
+                    }
+                    else
+                    {
+                        // Same as above but no reduction
+                        SEAL_ITERATE(iter(t_operand, get<0>(K)[key_index], get<1>(K)), coeff_count, [&](auto L) {
+                            unsigned long long qword[2]{ 0, 0 };
+                            multiply_uint64(get<0>(L), get<1>(L), qword);
+                            add_uint128(qword, get<2>(L).ptr(), qword);
+                            get<2>(L)[0] = qword[0];
+                            get<2>(L)[1] = qword[1];
+                        });
+                    }
+                });
 
-    //    //Temp ciphertexts for computation
-    //    vector<vector<Ciphertext> > lift_encrypted;
-    //    lift_encrypted.resize(r);
-    //    for (int i = 0; i < r; i++)
-    //    {
-    //        lift_encrypted[i].resize(k - 1);
-    //    }
+                if (!--lazy_reduction_counter)
+                {
+                    lazy_reduction_counter = lazy_reduction_summand_bound;
+                }
+            });
 
-    //    Ciphertext cipher(parms_, pool_);
-    //    cipher = encrypted;
+            // PolyIter pointing to the destination t_poly_prod, shifted to the appropriate modulus
+            PolyIter t_poly_prod_iter(t_poly_prod.get() + (I * coeff_count), coeff_count, rns_modulus_size);
 
-    //    uint64_t plain_modulus_ = parms_.plain_modulus().value();
-    //    for (int i = 0; i < r; i++)
-    //    {
-    //        SmallModulus eval_plain_modulus(plain_modulus_);
-    //        if (i < r - 1)
-    //        {
-    //            polynomial_evaluation(cipher, lift[0], evaluation_keys, eval_plain_modulus, lift_encrypted[i][0]);
-    //        }
-    //        polynomial_evaluation(cipher, remainlsd[e - i - 2], evaluation_keys, eval_plain_modulus, destination[i]);
-    //        for (int j = 0; j < k - 2; j++)
-    //        {
-    //            if (i + j < r - 1)
-    //            {
-    //                polynomial_evaluation(lift_encrypted[i][j], lift[j + 1], evaluation_keys, eval_plain_modulus, 
-    //                    lift_encrypted[i][j + 1]);
-    //            }
-    //        }
-    //        cipher = encrypted;
-    //        if (i < r - 1)
-    //        {
-    //            for (int j = 0; j < i + 1; j++)
-    //            {
-    //                if (i - j > k - 2)
-    //                {
-    //                    sub(cipher, destination[j], cipher);
-    //                }
-    //                else
-    //                {
-    //                    sub(cipher, lift_encrypted[j][i - j], cipher);
-    //                }
-    //            }
-    //        }
-    //        plain_modulus_ /= p;
-    //    }
-    //}
+            // Final modular reduction
+            SEAL_ITERATE(iter(accumulator_iter, t_poly_prod_iter), key_component_count, [&](auto K) {
+                if (lazy_reduction_counter == lazy_reduction_summand_bound)
+                {
+                    SEAL_ITERATE(iter(get<0>(K), *get<1>(K)), coeff_count, [&](auto L) {
+                        get<1>(L) = static_cast<uint64_t>(*get<0>(L));
+                    });
+                }
+                else
+                {
+                    // Same as above except need to still do reduction
+                    SEAL_ITERATE(iter(get<0>(K), *get<1>(K)), coeff_count, [&](auto L) {
+                        get<1>(L) = barrett_reduce_128(get<0>(L).ptr(), key_modulus[key_index]);
+                    });
+                }
+            });
+        });
+        // Accumulated products are now stored in t_poly_prod
 
-    ///**
-    //Recursive polynomial evaution methdod,
-    //First, f(x) = ((X^{k2^{step-1}}) + a(x)) * q(x) + X^(k2^{step-1}-1) + b(x)
-    //Second, Compute q(x) and X^(k2^{step-1}-1) + b(x) using recursive function call
-    //Third, the step = 1, just do dot product and return
-    //*/
-    //void Evaluator::paterson_stockmeyer(vector<Ciphertext> &baby_step, vector<Ciphertext> &giant_step, Ciphertext &encrypted, vector<uint64_t> &coeff, const EvaluationKeys &evaluation_keys, Ciphertext &destination, int k, int step)
-    //{
-    //    //Check input coeff degree = k* (2^step - 1)?
-    //    int current_degree = (exponentiate_uint64(2, step) - 1) * k;
-    //    if (coeff.size() != current_degree + 1)
-    //    {
-    //        invalid_argument("degree is incorrect for PatersonStockmeyer method");
-    //    }
+        // Perform modulus switching with scaling
+        PolyIter t_poly_prod_iter(t_poly_prod.get(), coeff_count, rns_modulus_size);
+        SEAL_ITERATE(iter(encrypted, t_poly_prod_iter), key_component_count, [&](auto I) {
+            // Lazy reduction; this needs to be then reduced mod qi
+            CoeffIter t_last(get<1>(I)[decomp_modulus_size]);
+            inverse_ntt_negacyclic_harvey_lazy(t_last, key_ntt_tables[key_modulus_size - 1]);
 
-    //    //If the degree is k, do just dot product
-    //    if (step == 1) 
-    //    {
-    //        polynomial_evaluation(baby_step, coeff, evaluation_keys, destination);
-    //        return;
-    //    }
+            // Add (p-1)/2 to change from flooring to rounding.
+            const uint64_t qk = key_modulus[key_modulus_size - 1].value();
+            const uint64_t qk_half = qk >> 1;
+            SEAL_ITERATE(t_last, coeff_count, [&](auto &J) {
+                J = barrett_reduce_64(J + qk_half, key_modulus[key_modulus_size - 1]);
+            });
 
-    //    uint64_t plain_modulus_ = parms_.plain_modulus().value();
+            SEAL_ITERATE(iter(I, key_modulus, key_ntt_tables, modswitch_factors), decomp_modulus_size, [&](auto J) {
+                SEAL_ALLOCATE_GET_COEFF_ITER(t_ntt, coeff_count, pool);
 
-    //    // Set q(x) and r(x) to be a f(x) = q(x) * X^{k2^{step-1}} + r(x)
-    //    uint64_t temp_degree = (exponentiate_uint64(2, step - 1) * k) - 1;
-    //    uint64_t next_degree = (exponentiate_uint64(2, step - 1) - 1) * k;
-    //    vector<uint64_t> qx(next_degree + 1);
-    //    vector<uint64_t> rx(temp_degree + 1);
-    //    for (uint64_t i = 0; i < coeff.size(); i++)
-    //    {
-    //        if (i < temp_degree + 1)
-    //        {
-    //            rx[i] = coeff[i];
-    //        }
-    //        else
-    //        {
-    //            qx[i - temp_degree - 1] = coeff[i];
-    //        }
-    //    }
+                // (ct mod 4qk) mod qi
+                const uint64_t qi = get<1>(J).value();
+                if (qk > qi)
+                {
+                    // This cannot be spared. NTT only tolerates input that is less than 4*modulus (i.e. qk <=4*qi).
+                    modulo_poly_coeffs(t_last, coeff_count, get<1>(J), t_ntt);
+                }
+                else
+                {
+                    set_uint(t_last, coeff_count, t_ntt);
+                }
 
-    //    // r(x) = r(x) - X^(k2^{step-1}-1)
-    //    if (rx[next_degree] > 0)
-    //    {
-    //        rx[next_degree] -= 1;
-    //    }
-    //    else
-    //    {
-    //        rx[next_degree] += plain_modulus_ - 1;
-    //    }
+                // Lazy substraction, results in [0, 2*qi), since fix is in [0, qi].
+                const uint64_t fix = qi - barrett_reduce_64(qk_half, get<1>(J));
+                SEAL_ITERATE(t_ntt, coeff_count, [fix](auto &K) { K += fix; });
 
-    //    // convert from vector to BigPoly
-    //    BigPoly poly_qx(rx.size(), 64);
-    //    set_uint_uint(qx.data(), qx.size(), poly_qx.data());
+                uint64_t qi_lazy = qi << 1; // some multiples of qi
+                if (scheme == scheme_type::CKKS)
+                {
+                    // This ntt_negacyclic_harvey_lazy results in [0, 4*qi).
+                    ntt_negacyclic_harvey_lazy(t_ntt, get<2>(J));
+#if SEAL_USER_MOD_BIT_COUNT_MAX > 60
+                    // Reduce from [0, 4qi) to [0, 2qi)
+                    SEAL_ITERATE(t_ntt, coeff_count, [&](auto &K) {
+                        K -= (qi_lazy & static_cast<uint64_t>(-static_cast<int64_t>(K >= qi_lazy)));
+                    });
+#else
+                    // Since SEAL uses at most 60bit moduli, 8*qi < 2^63.
+                    qi_lazy = qi << 2;
+#endif
+                }
+                else if (scheme == scheme_type::BFV)
+                {
+                    inverse_ntt_negacyclic_harvey_lazy(get<0, 1>(J), get<2>(J));
+                }
 
-    //    for (int i = qx.size(); i < rx.size(); i++)
-    //    {
-    //        poly_qx[i].set_zero();
-    //    }
+                // ((ct mod qi) - (ct mod qk)) mod qi
+                SEAL_ITERATE(iter(get<0, 1>(J), t_ntt), coeff_count, [&](auto K) { get<0>(K) += qi_lazy - get<1>(K); });
 
-    //    // convert from vector to BigPoly
-    //    BigPoly poly_rx(rx.size(), 64);
-    //    set_uint_uint(rx.data(), rx.size(), poly_rx.data());
-
-    //    // r(x) = a(x) * q(x) + b(x)
-    //    BigPoly poly_ax(poly_rx.coeff_count(), parms_.plain_modulus().bit_count());
-    //    BigPoly poly_bx(poly_rx.coeff_count(), parms_.plain_modulus().bit_count());
-    //    divide_poly_poly_coeffmod(poly_rx.data(), poly_qx.data(), poly_rx.coeff_count(), parms_.plain_modulus(), poly_ax.data(), poly_bx.data(), pool_);
-
-    //    //Convert bigpoly to vector<uint64_t>
-    //    vector<uint64_t> ax(poly_ax.significant_coeff_count());
-    //    for (int i = 0; i < poly_ax.significant_coeff_count(); i++)
-    //    {
-    //        ax[i] = *(poly_ax[i].data());
-    //    }
-
-    //    // Evaluate ax using baby_step (dot product)
-    //    Ciphertext encrypted_ax(parms_, pool_);
-    //    polynomial_evaluation(baby_step, ax, evaluation_keys, encrypted_ax);
-
-    //    // Compute (X^{k2^{step-1}}) + a(x) using addition
-    //    Ciphertext encrypted_ax_add_power_of_two(encrypted_ax);
-    //    add(giant_step[step - 2], encrypted_ax_add_power_of_two);
-
-    //    // Compute bx polynomial = X^(k2^{step-1}-1) + b(x)
-    //    vector<uint64_t> bx(next_degree + 1);
-    //    for (int i = 0; i < poly_bx.significant_coeff_count(); i++)
-    //    {
-    //        bx[i] = *(poly_bx[i].data());
-    //    }
-    //    for (int i = poly_bx.significant_coeff_count(); i < next_degree; i++)
-    //    {
-    //        bx[i] = 0;
-    //    }
-    //    bx[next_degree] = 1;
-
-    //    // Evaluate q(x) recursively
-    //    Ciphertext encrypted_qx(parms_, pool_);
-    //    paterson_stockmeyer(baby_step, giant_step, encrypted, qx, evaluation_keys, encrypted_qx, k, step - 1);
-
-    //    // Evaluate X^(k2^{step-1}-1) + b(x) recursively
-    //    Ciphertext encrypted_bx(parms_, pool_);
-    //    paterson_stockmeyer(baby_step, giant_step, encrypted, bx, evaluation_keys, encrypted_bx, k, step - 1);
-
-    //    // Compute ((X^{k2^{step-1}}) + a(x)) * q(x)
-    //    Ciphertext encrypted_part(parms_, pool_);
-    //    multiply(encrypted_ax_add_power_of_two, encrypted_qx, encrypted_part);
-    //    relinearize(encrypted_part, evaluation_keys);
-
-    //    //Compute f(x) = [((X^{k2^{step-1}}) + a(x)) * q(x)] + X^(k2^{step-1}-1) + b(x)
-    //    destination = encrypted_part;
-    //    add(encrypted_bx, destination);
-    //}
-
-    //void Evaluator::polynomial_evaluation(const vector<Ciphertext> &all_powers_encrypted, vector<uint64_t> &coeff, const EvaluationKeys &evaluation_keys, Ciphertext &destination)
-    //{
-    //    // Check whether we have enough all powers
-    //    if (all_powers_encrypted.size() < coeff.size())
-    //    {
-    //        throw invalid_argument("there are not enough powers_encrypted");
-    //    }
-
-    //    // Extract encryption parameters.
-    //    int coeff_count = parms_.poly_modulus().coeff_count();
-    //    int coeff_mod_count = parms_.coeff_modulus().size();
-    //    int encrypted_size = all_powers_encrypted[0].size();
-
-    //    // Initialize destination
-    //    destination.resize(parms_, encrypted_size);
-    //    destination.set_zero();
-
-    //    // Dot product
-    //    int degree = coeff.size() - 1;
-
-    //    for (int i = 0; i < degree + 1; i++)
-    //    {
-    //        if (coeff[i] != 0)
-    //        {
-    //            for (int j = 0; j < encrypted_size; j++)
-    //            {
-    //                const uint64_t *all_powers_encrypted_ptr = all_powers_encrypted[i].data(j);
-    //                uint64_t *destination_ptr = destination.data(j);
-    //                for (int k = 0; k < coeff_mod_count; k++)
-    //                {
-    //                    for (int m = 0; m < coeff_count; m++)
-    //                    {
-    //                        // Lazy reduction
-    //                        uint64_t temp[2];
-    //                        multiply_uint64(all_powers_encrypted_ptr[m + (k * coeff_count)], coeff[i], temp);
-    //                        temp[1] += add_uint64(destination_ptr[m + (k * coeff_count)], temp[0], 0, temp);
-    //                        destination_ptr[m + (k * coeff_count)] = barrett_reduce_128(temp, coeff_modulus_[k]);
-    //                    }
-    //                }
-    //            }
-    //        }
-    //    }
-    //}
-
-    //void Evaluator::compute_all_powers(const Ciphertext &encrypted, int degree, const EvaluationKeys &evaluation_keys, vector<Ciphertext> &destination)
-    //{
-    //    // Verify parameters.
-    //    if (encrypted.hash_block_ != parms_.hash_block())
-    //    {
-    //        throw invalid_argument("encrypted is not valid for encryption parameters");
-    //    }
-
-    //    // Extract encryption parameters.
-    //    int coeff_count = parms_.poly_modulus().coeff_count();
-    //    int coeff_mod_count = parms_.coeff_modulus().size();
-    //    int coeff_bit_count = coeff_mod_count * bits_per_uint64;
-    //    int encrypted_size = encrypted.size();
-
-    //    // Resize destination and clear
-    //    destination.resize(degree + 1);
-    //    destination[0].resize(parms_, encrypted_size);
-    //    destination[0].set_zero();
-
-    //    // Set destination[0] = (Delta, 0, ..., 0)
-    //    BigUInt coeff_div_current_plain_modulus_(coeff_bit_count);
-    //    Pointer temp(allocate_uint(coeff_mod_count, pool_));
-    //    Pointer wide_plain_modulus(allocate_uint(coeff_mod_count, pool_));
-    //    set_uint_uint(parms_.plain_modulus().data(), parms_.plain_modulus().uint64_count(), coeff_mod_count, 
-    //        wide_plain_modulus.get());
-    //    divide_uint_uint(product_modulus_.get(), wide_plain_modulus.get(), coeff_mod_count, 
-    //        coeff_div_current_plain_modulus_.data(), temp.get(), pool_);
-    //    set_uint_uint(coeff_div_current_plain_modulus_.data(), coeff_mod_count, destination[0].data());
-    //    decompose(destination[0].data());
-
-    //    //Compute all X^{2^i} using square function
-    //    int log_2_degree = static_cast<int>(floor(log2(degree)));
-    //    vector<Ciphertext> all_two_powers_encrypted(log_2_degree + 1);
-    //    all_two_powers_encrypted[0] = encrypted;
-    //    for (int i = 1; i <= log_2_degree; i++)
-    //    {
-    //        square(all_two_powers_encrypted[i - 1], all_two_powers_encrypted[i]);
-    //        relinearize(all_two_powers_encrypted[i], evaluation_keys);
-    //    }
-
-    //    // Compute all X^{i} using multiplication tree
-    //    for (uint64_t i = 1; i <= degree; i++)
-    //    {
-    //        uint64_t i1 = hamming_weight_split(i);
-    //        uint64_t i2 = i - i1;
-    //        if (i1 == 0 || i2 == 0)
-    //        {
-    //            destination[i].resize(parms_, encrypted_size);
-    //            destination[i] = all_two_powers_encrypted[get_significant_bit_count(static_cast<uint64_t>(i)) - 1];
-    //        }
-    //        else
-    //        {
-    //            destination[i].resize(parms_, encrypted_size);
-    //            multiply(destination[i1], destination[i2], destination[i]);
-    //            relinearize(destination[i], evaluation_keys);
-    //        }
-    //    }
-    //}
-}
+                // qk^(-1) * ((ct mod qi) - (ct mod qk)) mod qi
+                multiply_poly_scalar_coeffmod(get<0, 1>(J), coeff_count, get<3>(J), get<1>(J), get<0, 1>(J));
+                add_poly_coeffmod(get<0, 1>(J), get<0, 0>(J), coeff_count, get<1>(J), get<0, 0>(J));
+            });
+        });
+    }
+} // namespace seal

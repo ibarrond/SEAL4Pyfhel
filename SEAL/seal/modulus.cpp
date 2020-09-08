@@ -1,181 +1,174 @@
-#include "modulus.h"
-#include "uintcore.h"
-#include "uintarith.h"
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
+#include "seal/modulus.h"
+#include "seal/util/common.h"
+#include "seal/util/numth.h"
+#include "seal/util/uintarith.h"
+#include "seal/util/uintarithsmallmod.h"
+#include <numeric>
+#include <stdexcept>
+#include <unordered_map>
 
 using namespace std;
+using namespace seal::util;
 
 namespace seal
 {
-    namespace util
+    void Modulus::save_members(ostream &stream) const
     {
-        namespace
+        auto old_except_mask = stream.exceptions();
+        try
         {
-            bool is_inverse_small(const uint64_t *operand, int bit_count)
-            {
-#ifdef SEAL_DEBUG
-                if (operand == nullptr)
-                {
-                    throw invalid_argument("operand");
-                }
-                if (bit_count <= 0)
-                {
-                    throw invalid_argument("bit_count");
-                }
-                if (is_zero_uint(operand, divide_round_up(bit_count, bits_per_uint64)))
-                {
-                    throw invalid_argument("operand");
-                }
-#endif
-                const int fast_mod_threshold = 5;
-                // We know operand has a '1' at position bit_count, but we only care about bits bit_count - 1
-                // because result will have a '0' at position bit_count and this allows us to handle case
-                // operand is of form one bit followed by all zeros.
-                bit_count--;
-                int uint64_count = divide_round_up(bit_count, bits_per_uint64);
-                int high_value_bits = bit_count % bits_per_uint64;
-                uint64_t high_value_filter = (1ULL << high_value_bits) - 1;
-                int sig_bit_count = 0;
-                bool carry = true;
-                for (int i = 0; i < uint64_count; ++i)
-                {
-                    uint64_t value = ~*operand++;
-                    uint64_t sum = value;
-                    if (carry)
-                    {
-                        sum++;
-                        carry = sum == 0;
-                    }
-                    if (i == uint64_count - 1)
-                    {
-                        sum &= high_value_filter;
-                    }
-                    if (sum != 0)
-                    {
-                        sig_bit_count = get_significant_bit_count(sum) + (i * bits_per_uint64);
-                    }
-                }
-                return bit_count - sig_bit_count >= fast_mod_threshold;
-            }
+            // Throw exceptions on std::ios_base::badbit and std::ios_base::failbit
+            stream.exceptions(ios_base::badbit | ios_base::failbit);
+
+            stream.write(reinterpret_cast<const char *>(&value_), sizeof(uint64_t));
         }
-
-        Modulus::Modulus(const std::uint64_t *modulus, int uint64_count) : 
-            modulus_(modulus), uint64_count_(uint64_count)
+        catch (const ios_base::failure &)
         {
-#ifdef SEAL_DEBUG
-            if (modulus == nullptr)
-            {
-                throw invalid_argument("modulus");
-            }
-            if (uint64_count <= 0)
-            {
-                throw invalid_argument("uint64_count");
-            }
-            if (is_zero_uint(modulus, uint64_count))
-            {
-                throw invalid_argument("modulus");
-            }
-#endif
-            significant_bit_count_ = get_significant_bit_count_uint(modulus, uint64_count);
-            power_of_two_minus_one_ = get_power_of_two_minus_one_uint(modulus, uint64_count);
-            if (is_inverse_small(modulus, significant_bit_count_))
-            {
-                // Calculate inverse modulus (clipped to modulus_bits).
-                inverse_modulus_ = Pointer::Owning(new uint64_t[uint64_count]);
-                negate_uint(modulus, uint64_count, inverse_modulus_.get());
-                filter_highbits_uint(inverse_modulus_.get(), uint64_count, significant_bit_count_ - 1);
-                inverse_significant_bit_count_ = get_significant_bit_count_uint(inverse_modulus_.get(), uint64_count);
-            }
+            stream.exceptions(old_except_mask);
+            throw runtime_error("I/O error");
         }
-
-        Modulus::Modulus(const std::uint64_t *modulus, int uint64_count, MemoryPool &pool) : 
-            modulus_(modulus), uint64_count_(uint64_count)
+        catch (...)
         {
-#ifdef SEAL_DEBUG
-            if (modulus == nullptr)
-            {
-                throw invalid_argument("modulus");
-            }
-            if (uint64_count <= 0)
-            {
-                throw invalid_argument("uint64_count");
-            }
-            if (is_zero_uint(modulus, uint64_count))
-            {
-                throw invalid_argument("modulus");
-            }
-#endif
-            significant_bit_count_ = get_significant_bit_count_uint(modulus, uint64_count);
-            power_of_two_minus_one_ = get_power_of_two_minus_one_uint(modulus, uint64_count);
-            if (is_inverse_small(modulus, significant_bit_count_))
-            {
-                // Calculate inverse modulus (clipped to modulus_bits).
-                inverse_modulus_ = allocate_uint(uint64_count, pool);
-                negate_uint(modulus, uint64_count, inverse_modulus_.get());
-                filter_highbits_uint(inverse_modulus_.get(), uint64_count, significant_bit_count_ - 1);
-                inverse_significant_bit_count_ = get_significant_bit_count_uint(inverse_modulus_.get(), uint64_count);
-            }
+            stream.exceptions(old_except_mask);
+            throw;
         }
+        stream.exceptions(old_except_mask);
+    }
 
-        Modulus &Modulus::operator=(const Modulus &assign)
+    void Modulus::load_members(istream &stream)
+    {
+        auto old_except_mask = stream.exceptions();
+        try
         {
-            if (this == &assign)
-            {
-                return *this;
-            }
+            // Throw exceptions on std::ios_base::badbit and std::ios_base::failbit
+            stream.exceptions(ios_base::badbit | ios_base::failbit);
 
-            modulus_ = assign.modulus_;
-            uint64_count_ = assign.uint64_count_;
-            significant_bit_count_ = assign.significant_bit_count_;
-            power_of_two_minus_one_ = assign.power_of_two_minus_one_;
-            inverse_significant_bit_count_ = assign.inverse_significant_bit_count_;
-
-            // Copy over inverse modulus if needed
-            inverse_modulus_.release();
-            if (assign.inverse_modulus_.is_set())
-            {
-                inverse_modulus_ = Pointer::Owning(new uint64_t[uint64_count_]);
-                set_uint_uint(assign.inverse_modulus_.get(), uint64_count_, inverse_modulus_.get());
-            }
-
-            return *this;
+            uint64_t value;
+            stream.read(reinterpret_cast<char *>(&value), sizeof(uint64_t));
+            set_value(value);
         }
-
-        Modulus::Modulus(const Modulus &copy) : 
-            modulus_(nullptr), uint64_count_(0), significant_bit_count_(0),
-            power_of_two_minus_one_(-1), inverse_significant_bit_count_(0)
+        catch (const ios_base::failure &)
         {
-            operator =(copy);
+            stream.exceptions(old_except_mask);
+            throw runtime_error("I/O error");
         }
-
-        Modulus &Modulus::operator =(Modulus &&assign)
+        catch (...)
         {
-            modulus_ = assign.modulus_;
-            uint64_count_ = assign.uint64_count_;
-            significant_bit_count_ = assign.significant_bit_count_;
-            power_of_two_minus_one_ = assign.power_of_two_minus_one_;
-            inverse_significant_bit_count_ = assign.inverse_significant_bit_count_;
-
-            // Can throw!
-            inverse_modulus_.acquire(assign.inverse_modulus_);
-
-            assign.modulus_ = nullptr;
-            assign.uint64_count_ = 0;
-            assign.significant_bit_count_ = 0;
-            assign.power_of_two_minus_one_ = 0;
-            assign.inverse_significant_bit_count_ = 0;
-
-            return *this;
+            stream.exceptions(old_except_mask);
+            throw;
         }
+        stream.exceptions(old_except_mask);
+    }
 
-        Modulus::Modulus(Modulus &&source) noexcept : modulus_(source.modulus_), uint64_count_(source.uint64_count_), 
-            significant_bit_count_(source.significant_bit_count_), power_of_two_minus_one_(source.power_of_two_minus_one_), 
-            inverse_significant_bit_count_(source.inverse_significant_bit_count_), inverse_modulus_(move(source.inverse_modulus_))
+    void Modulus::set_value(uint64_t value)
+    {
+        if (value == 0)
         {
-            source.modulus_ = nullptr;
-            source.uint64_count_ = 0;
-            source.significant_bit_count_ = 0;
-            source.power_of_two_minus_one_ = 0;
-            source.inverse_significant_bit_count_ = 0;
+            // Zero settings
+            bit_count_ = 0;
+            uint64_count_ = 1;
+            value_ = 0;
+            const_ratio_ = { { 0, 0, 0 } };
+            is_prime_ = false;
+        }
+        else if ((value >> SEAL_MOD_BIT_COUNT_MAX != 0) || (value == 1))
+        {
+            throw invalid_argument("value can be at most 61-bit and cannot be 1");
+        }
+        else
+        {
+            // All normal, compute const_ratio and set everything
+            value_ = value;
+            bit_count_ = get_significant_bit_count(value_);
+
+            // Compute Barrett ratios for 64-bit words (barrett_reduce_128)
+            uint64_t numerator[3]{ 0, 0, 1 };
+            uint64_t quotient[3]{ 0, 0, 0 };
+
+            // Use a special method to avoid using memory pool
+            divide_uint192_inplace(numerator, value_, quotient);
+
+            const_ratio_[0] = quotient[0];
+            const_ratio_[1] = quotient[1];
+
+            // We store also the remainder
+            const_ratio_[2] = numerator[0];
+
+            uint64_count_ = 1;
+
+            // Set the primality flag
+            is_prime_ = util::is_prime(*this);
         }
     }
-}
+
+    vector<Modulus> CoeffModulus::BFVDefault(size_t poly_modulus_degree, sec_level_type sec_level)
+    {
+        if (!MaxBitCount(poly_modulus_degree, sec_level))
+        {
+            throw invalid_argument("non-standard poly_modulus_degree");
+        }
+        if (sec_level == sec_level_type::none)
+        {
+            throw invalid_argument("invalid security level");
+        }
+
+        switch (sec_level)
+        {
+        case sec_level_type::tc128:
+            return global_variables::GetDefaultCoeffModulus128().at(poly_modulus_degree);
+
+        case sec_level_type::tc192:
+            return global_variables::GetDefaultCoeffModulus192().at(poly_modulus_degree);
+
+        case sec_level_type::tc256:
+            return global_variables::GetDefaultCoeffModulus256().at(poly_modulus_degree);
+
+        default:
+            throw runtime_error("invalid security level");
+        }
+    }
+
+    vector<Modulus> CoeffModulus::Create(size_t poly_modulus_degree, vector<int> bit_sizes)
+    {
+        if (poly_modulus_degree > SEAL_POLY_MOD_DEGREE_MAX || poly_modulus_degree < SEAL_POLY_MOD_DEGREE_MIN ||
+            get_power_of_two(static_cast<uint64_t>(poly_modulus_degree)) < 0)
+        {
+            throw invalid_argument("poly_modulus_degree is invalid");
+        }
+        if (bit_sizes.size() > SEAL_COEFF_MOD_COUNT_MAX)
+        {
+            throw invalid_argument("bit_sizes is invalid");
+        }
+        if (accumulate(
+                bit_sizes.cbegin(), bit_sizes.cend(), SEAL_USER_MOD_BIT_COUNT_MIN,
+                [](int a, int b) { return max(a, b); }) > SEAL_USER_MOD_BIT_COUNT_MAX ||
+            accumulate(bit_sizes.cbegin(), bit_sizes.cend(), SEAL_USER_MOD_BIT_COUNT_MAX, [](int a, int b) {
+                return min(a, b);
+            }) < SEAL_USER_MOD_BIT_COUNT_MIN)
+        {
+            throw invalid_argument("bit_sizes is invalid");
+        }
+
+        unordered_map<int, size_t> count_table;
+        unordered_map<int, vector<Modulus>> prime_table;
+        for (int size : bit_sizes)
+        {
+            ++count_table[size];
+        }
+        for (const auto &table_elt : count_table)
+        {
+            prime_table[table_elt.first] = get_primes(poly_modulus_degree, table_elt.first, table_elt.second);
+        }
+
+        vector<Modulus> result;
+        for (int size : bit_sizes)
+        {
+            result.emplace_back(prime_table[size].back());
+            prime_table[size].pop_back();
+        }
+        return result;
+    }
+} // namespace seal

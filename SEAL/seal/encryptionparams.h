@@ -1,23 +1,53 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
 #pragma once
 
+#include "seal/memorymanager.h"
+#include "seal/modulus.h"
+#include "seal/randomgen.h"
+#include "seal/serialization.h"
+#include "seal/util/defines.h"
+#include "seal/util/globals.h"
+#include "seal/util/hash.h"
+#include "seal/util/ztools.h"
+#include <functional>
 #include <iostream>
-#include <string>
-#include <array>
-#include "defines.h"
-#include "globals.h"
-#include "bigpoly.h"
-#include "randomgen.h"
-#include "smallmodulus.h"
-#include "hash.h"
-#include "defaultparams.h"
+#include <memory>
+#include <numeric>
 
 namespace seal
 {
     /**
-    Represents user-customizable encryption scheme settings. The parameters (most 
-    importantly poly_modulus, coeff_modulus, plain_modulus) significantly affect 
-    the performance, capabilities, and security of the encryption scheme. Once 
-    an instance of EncryptionParameters is populated with appropriate parameters, 
+    Describes the type of encryption scheme to be used.
+    */
+    enum class scheme_type : std::uint8_t
+    {
+        // No scheme set; cannot be used for encryption
+        none = 0x0,
+
+        // Brakerski/Fan-Vercauteren scheme
+        BFV = 0x1,
+
+        // Cheon-Kim-Kim-Song scheme
+        CKKS = 0x2
+    };
+
+    /**
+    The data type to store unique identifiers of encryption parameters.
+    */
+    using parms_id_type = util::HashFunction::hash_block_type;
+
+    /**
+    A parms_id_type value consisting of zeros.
+    */
+    extern const parms_id_type parms_id_zero;
+
+    /**
+    Represents user-customizable encryption scheme settings. The parameters (most
+    importantly poly_modulus, coeff_modulus, plain_modulus) significantly affect
+    the performance, capabilities, and security of the encryption scheme. Once
+    an instance of EncryptionParameters is populated with appropriate parameters,
     it can be used to create an instance of the SEALContext class, which verifies
     the validity of the parameters, and performs necessary pre-computations.
 
@@ -25,19 +55,23 @@ namespace seal
     application while balancing performance and security. Some encryption settings
     will not allow some inputs (e.g. attempting to encrypt a polynomial with more
     coefficients than poly_modulus or larger coefficients than plain_modulus) or,
-    support the desired computations (with noise growing too fast due to too large 
+    support the desired computations (with noise growing too fast due to too large
     plain_modulus and too small coeff_modulus).
 
-    @par Hash Block
-    The EncryptionParameters class maintains at all times a 256-bit SHA-3 hash of 
-    the currently set encryption parameters. This hash is then stored by all further
-    objects created for these encryption parameters, e.g. SEALContext, KeyGenerator,
-    Encryptor, Decryptor, Evaluator, all secret and public keys, and ciphertexts.
-    The hash block is not intended to be directly modified by the user, and is used
-    internally to perform quick input compatibility checks.
+    @par parms_id
+    The EncryptionParameters class maintains at all times a 256-bit hash of the
+    currently set encryption parameters called the parms_id. This hash acts as
+    a unique identifier of the encryption parameters and is used by all further
+    objects created for these encryption parameters. The parms_id is not intended
+    to be directly modified by the user but is used internally for pre-computation
+    data lookup and input validity checks. In modulus switching the user can use
+    the parms_id to keep track of the chain of encryption parameters. The parms_id
+    is not exposed in the public API of EncryptionParameters, but can be accessed
+    through the SEALContext::ContextData class once the SEALContext has been created.
 
     @par Thread Safety
-    In general, reading from EncryptionParameters is thread-safe, while mutating is not.
+    In general, reading from EncryptionParameters is thread-safe, while mutating
+    is not.
 
     @warning Choosing inappropriate encryption parameters may lead to an encryption
     scheme that is not secure, does not perform well, and/or does not support the
@@ -47,18 +81,37 @@ namespace seal
     */
     class EncryptionParameters
     {
+        friend class SEALContext;
+
     public:
         /**
-        The data type to store a hash block.
+        Creates an empty set of encryption parameters.
+
+        @param[in] scheme The encryption scheme to be used
+        @see scheme_type for the supported schemes
         */
-        typedef util::HashFunction::sha3_block_type hash_block_type;
+        EncryptionParameters(scheme_type scheme = scheme_type::none) : scheme_(scheme)
+        {
+            compute_parms_id();
+        }
 
         /**
-        Creates an empty set of encryption parameters. At a minimum, the user needs to 
-        specify the parameters poly_modulus, coeff_modulus, and plain_modulus for the
-        parameters to be usable.
+        Creates an empty set of encryption parameters.
+
+        @param[in] scheme The encryption scheme to be used
+        @throws std::invalid_argument if scheme is not supported
         */
-        EncryptionParameters();
+        EncryptionParameters(std::uint8_t scheme)
+        {
+            // Check that a valid scheme is given
+            if (!is_valid_scheme(scheme))
+            {
+                throw std::invalid_argument("unsupported scheme");
+            }
+
+            scheme_ = static_cast<scheme_type>(scheme);
+            compute_parms_id();
+        }
 
         /**
         Creates a copy of a given instance of EncryptionParameters.
@@ -72,7 +125,7 @@ namespace seal
 
         @param[in] assign The EncryptionParameters to copy from
         */
-        EncryptionParameters &operator =(const EncryptionParameters &assign) = default;
+        EncryptionParameters &operator=(const EncryptionParameters &assign) = default;
 
         /**
         Creates a new EncryptionParameters instance by moving a given instance.
@@ -86,157 +139,149 @@ namespace seal
 
         @param[in] assign The EncryptionParameters to move from
         */
-        EncryptionParameters &operator =(EncryptionParameters &&assign) = default;
+        EncryptionParameters &operator=(EncryptionParameters &&assign) = default;
 
         /**
-        Sets the polynomial modulus parameter to the specified value (represented by 
-        BigPoly). The polynomial modulus directly affects the number of coefficients 
-        in plaintext polynomials, the size of ciphertext elements, the computational
-        performance of the scheme (bigger is worse), and the security level (bigger 
-        is better). In SEAL the polynomial modulus must be of the form "1x^N + 1",
-        where N is a power of 2 (e.g. 1024, 2048, 4096, 8192, 16384, or 32768).
+        Sets the degree of the polynomial modulus parameter to the specified value.
+        The polynomial modulus directly affects the number of coefficients in
+        plaintext polynomials, the size of ciphertext elements, the computational
+        performance of the scheme (bigger is worse), and the security level (bigger
+        is better). In Microsoft SEAL the degree of the polynomial modulus must be
+        a power of 2 (e.g.  1024, 2048, 4096, 8192, 16384, or 32768).
 
-        @param[in] poly_modulus The new polynomial modulus
-        @throws std::invalid_argument if poly_modulus is too large
+        @param[in] poly_modulus_degree The new polynomial modulus degree
+        @throws std::logic_error if a valid scheme is not set and poly_modulus_degree
+        is non-zero
         */
-        inline void set_poly_modulus(const BigPoly &poly_modulus)
+        inline void set_poly_modulus_degree(std::size_t poly_modulus_degree)
         {
-            if (poly_modulus.coeff_count() > SEAL_POLY_MOD_DEGREE_BOUND + 1 ||
-                poly_modulus.coeff_uint64_count() > 1)
+            if (scheme_ == scheme_type::none && poly_modulus_degree)
             {
-                throw std::invalid_argument("poly_modulus too large");
+                throw std::logic_error("poly_modulus_degree is not supported for this scheme");
             }
 
-            // Set the poly_modulus to be as small as possible
-            poly_modulus_.resize(1, 1);
+            // Set the degree
+            poly_modulus_degree_ = poly_modulus_degree;
 
-            // Now operator =(...) automatically resizes to (significant_coeff_count, 
-            // significant_coeff_bit_count) size
-            poly_modulus_ = poly_modulus;
-
-            // Re-compute the hash
-            compute_hash();
+            // Re-compute the parms_id
+            compute_parms_id();
         }
 
         /**
-        Sets the polynomial modulus parameter to the specified value (represented by
-        std::string). The polynomial modulus directly affects the number of coefficients
-        in plaintext polynomials, the size of ciphertext elements, the computational
-        performance of the scheme (bigger is worse), and the security level (bigger 
-        is better). In SEAL the polynomial modulus must be of the form "1x^N + 1",
-        where N is a power of 2 (e.g. 1024, 2048, 4096, 8192, 16384, or 32768).
-
-        @param[in] poly_modulus The new polynomial modulus
-        @throws std::invalid_argument if poly_modulus is too large
-        */
-        inline void set_poly_modulus(const std::string &poly_modulus)
-        {
-            // Needed to enable char[] arguments
-            set_poly_modulus(BigPoly(poly_modulus));
-        }
-
-        /**
-        Sets the coefficient modulus parameter. The coefficient modulus consists of a list 
-        of distinct prime numbers, and is represented by a vector of SmallModulus objects. 
-        The coefficient modulus directly affects the size of ciphertext elements, the 
-        amount of computation that the scheme can perform (bigger is better), and the 
-        security level (bigger is worse). In SEAL each of the prime numbers in the 
-        coefficient modulus must be at most 60 bits, and must be congruent to 1 modulo 
-        2*degree(poly_modulus).
+        Sets the coefficient modulus parameter. The coefficient modulus consists
+        of a list of distinct prime numbers, and is represented by a vector of
+        Modulus objects. The coefficient modulus directly affects the size
+        of ciphertext elements, the amount of computation that the scheme can
+        perform (bigger is better), and the security level (bigger is worse). In
+        Microsoft SEAL each of the prime numbers in the coefficient modulus must
+        be at most 60 bits, and must be congruent to 1 modulo 2*poly_modulus_degree.
 
         @param[in] coeff_modulus The new coefficient modulus
-        @throws std::invalid_argument if size of coeff_modulus is too large
+        @throws std::logic_error if a valid scheme is not set and coeff_modulus is
+        is non-empty
+        @throws std::invalid_argument if size of coeff_modulus is invalid
         */
-        inline void set_coeff_modulus(const std::vector<SmallModulus> &coeff_modulus)
+        inline void set_coeff_modulus(const std::vector<Modulus> &coeff_modulus)
         {
-            // Set the coeff_modulus_
-            if (coeff_modulus_.size() > SEAL_COEFF_MOD_COUNT_BOUND)
+            // Check that a scheme is set
+            if (scheme_ == scheme_type::none)
             {
-                throw std::invalid_argument("coeff_modulus too large");
+                if (!coeff_modulus.empty())
+                {
+                    throw std::logic_error("coeff_modulus is not supported for this scheme");
+                }
             }
+            else if (coeff_modulus.size() > SEAL_COEFF_MOD_COUNT_MAX || coeff_modulus.size() < SEAL_COEFF_MOD_COUNT_MIN)
+            {
+                throw std::invalid_argument("coeff_modulus is invalid");
+            }
+
             coeff_modulus_ = coeff_modulus;
 
-            // Re-compute the hash
-            compute_hash();
+            // Re-compute the parms_id
+            compute_parms_id();
         }
 
         /**
-        Sets the plaintext modulus parameter. The plaintext modulus is an integer modulus
-        represented by the SmallModulus class. The plaintext modulus determines the largest
-        coefficient that plaintext polynomials can represent. It also affects the amount of
-        computation that the scheme can perform (bigger is worse). In SEAL the plaintext 
-        modulus can be at most 60 bits long, but can otherwise be any integer. Note, however, 
-        that some features (e.g. batching) require the plaintext modulus to be of a particular 
-        form. 
+        Sets the plaintext modulus parameter. The plaintext modulus is an integer
+        modulus represented by the Modulus class. The plaintext modulus
+        determines the largest coefficient that plaintext polynomials can represent.
+        It also affects the amount of computation that the scheme can perform
+        (bigger is worse). In Microsoft SEAL the plaintext modulus can be at most
+        60 bits long, but can otherwise be any integer. Note, however, that some
+        features (e.g. batching) require the plaintext modulus to be of a particular
+        form.
 
         @param[in] plain_modulus The new plaintext modulus
+        @throws std::logic_error if scheme is not scheme_type::BFV and plain_modulus
+        is non-zero
         */
-        inline void set_plain_modulus(const SmallModulus &plain_modulus)
+        inline void set_plain_modulus(const Modulus &plain_modulus)
         {
+            // Check that scheme is BFV
+            if (scheme_ != scheme_type::BFV && !plain_modulus.is_zero())
+            {
+                throw std::logic_error("plain_modulus is not supported for this scheme");
+            }
+
             plain_modulus_ = plain_modulus;
 
-            // Re-compute the hash
-            compute_hash();
+            // Re-compute the parms_id
+            compute_parms_id();
         }
 
         /**
-        Sets the plaintext modulus parameter. The plaintext modulus is an integer modulus
-        represented by the SmallModulus class. This constructor instead takes a std::uint64_t
-        and automatically creates the SmallModulus object. The plaintext modulus determines 
-        the largest coefficient that plaintext polynomials can represent. It also affects the 
-        amount of computation that the scheme can perform (bigger is worse). In SEAL the 
-        plaintext modulus can be at most 60 bits long, but can otherwise be any integer. Note,
-        however, that some features (e.g. batching) require the plaintext modulus to be of 
-        a particular form.
+        Sets the plaintext modulus parameter. The plaintext modulus is an integer
+        modulus represented by the Modulus class. This constructor instead
+        takes a std::uint64_t and automatically creates the Modulus object.
+        The plaintext modulus determines the largest coefficient that plaintext
+        polynomials can represent. It also affects the amount of computation that
+        the scheme can perform (bigger is worse). In Microsoft SEAL the plaintext
+        modulus can be at most 60 bits long, but can otherwise be any integer. Note,
+        however, that some features (e.g. batching) require the plaintext modulus
+        to be of a particular form.
 
         @param[in] plain_modulus The new plaintext modulus
+        @throws std::invalid_argument if plain_modulus is invalid
         */
         inline void set_plain_modulus(std::uint64_t plain_modulus)
         {
-            set_plain_modulus(SmallModulus(plain_modulus));
+            set_plain_modulus(Modulus(plain_modulus));
         }
 
         /**
-        Sets the standard deviation of the noise distribution used for error sampling. This 
-        parameter directly affects the security level of the scheme. However, it should not be
-        necessary for most users to change this parameter from its default value.
-
-        @param[in] noise_standard_deviation The new standard deviation
-        */
-        inline void set_noise_standard_deviation(double noise_standard_deviation)
-        {
-            noise_standard_deviation_ = noise_standard_deviation;
-            noise_max_deviation_ = 
-                util::global_variables::noise_distribution_width_multiplier * noise_standard_deviation_;
-
-            // Re-compute the hash
-            compute_hash();
-        }
-
-        /**
-        Sets the random number generator factory to use for encryption. By default, the random
-        generator is set to UniformRandomGeneratorFactory::default_factory(). Setting this value
-        allows a user to specify a custom random number generator source.
+        Sets the random number generator factory to use for encryption. By default,
+        the random generator is set to UniformRandomGeneratorFactory::default_factory().
+        Setting this value allows a user to specify a custom random number generator
+        source.
 
         @param[in] random_generator Pointer to the random generator factory
         */
-        inline void set_random_generator(UniformRandomGeneratorFactory *random_generator)
+        inline void set_random_generator(std::shared_ptr<UniformRandomGeneratorFactory> random_generator) noexcept
         {
-            random_generator_ = random_generator;
+            random_generator_ = std::move(random_generator);
         }
 
         /**
-        Returns a const reference to the currently set polynomial modulus parameter.
+        Returns the encryption scheme type.
         */
-        inline const BigPoly &poly_modulus() const
+        SEAL_NODISCARD inline scheme_type scheme() const noexcept
         {
-            return poly_modulus_;
+            return scheme_;
+        }
+
+        /**
+        Returns the degree of the polynomial modulus parameter.
+        */
+        SEAL_NODISCARD inline std::size_t poly_modulus_degree() const noexcept
+        {
+            return poly_modulus_degree_;
         }
 
         /**
         Returns a const reference to the currently set coefficient modulus parameter.
         */
-        inline const std::vector<SmallModulus> &coeff_modulus() const
+        SEAL_NODISCARD inline auto coeff_modulus() const noexcept -> const std::vector<Modulus> &
         {
             return coeff_modulus_;
         }
@@ -244,111 +289,233 @@ namespace seal
         /**
         Returns a const reference to the currently set plaintext modulus parameter.
         */
-        inline const SmallModulus &plain_modulus() const
+        SEAL_NODISCARD inline const Modulus &plain_modulus() const noexcept
         {
             return plain_modulus_;
         }
 
         /**
-        Returns the currently set standard deviation of the noise distribution.
-        */
-        inline double noise_standard_deviation() const
-        {
-            return noise_standard_deviation_;
-        }
-
-        /**
-        Returns the currently set maximum deviation of the noise distribution. This value
-        cannot be directly controlled by the user, and is automatically set to be an 
-        appropriate multiple of the noise_standard_deviation parameter.
-        */
-        inline double noise_max_deviation() const
-        {
-            return noise_max_deviation_;
-        }
-
-        /**
         Returns a pointer to the random number generator factory to use for encryption.
         */
-        inline UniformRandomGeneratorFactory *random_generator() const
+        SEAL_NODISCARD inline auto random_generator() const noexcept -> std::shared_ptr<UniformRandomGeneratorFactory>
         {
             return random_generator_;
         }
 
         /**
-        Compares a given set of encryption parameters to the current set of encryption 
-        parameters. The comparison is performed by comparing hash blocks of the parameter 
-        sets rather than comparing the parameters individually.
+        Compares a given set of encryption parameters to the current set of
+        encryption parameters. The comparison is performed by comparing the
+        parms_ids of the parameter sets rather than comparing the parameters
+        individually.
 
         @parms[in] other The EncryptionParameters to compare against
         */
-        inline bool operator ==(const EncryptionParameters &other) const
+        SEAL_NODISCARD inline bool operator==(const EncryptionParameters &other) const noexcept
         {
-            return (hash_block_ == other.hash_block_);
+            return (parms_id_ == other.parms_id_);
         }
 
         /**
-        Compares a given set of encryption parameters to the current set of encryption
-        parameters. The comparison is performed by comparing hash blocks of the parameter
-        sets rather than comparing the parameters individually.
+        Compares a given set of encryption parameters to the current set of
+        encryption parameters. The comparison is performed by comparing
+        parms_ids of the parameter sets rather than comparing the parameters
+        individually.
 
         @parms[in] other The EncryptionParameters to compare against
         */
-        inline bool operator !=(const EncryptionParameters &other) const
+        SEAL_NODISCARD inline bool operator!=(const EncryptionParameters &other) const noexcept
         {
-            return (hash_block_ != other.hash_block_);
+            return (parms_id_ != other.parms_id_);
         }
 
         /**
-        Saves the EncryptionParameters to an output stream. The output is in binary format
-        and is not human-readable. The output stream must have the "Binary" flag set.
+        Returns an upper bound on the size of the EncryptionParameters, as if it
+        was written to an output stream.
 
-        @param[in] stream The stream to save the EncryptionParameters to
-        @see load() to load a saved EncryptionParameters instance.
+        @param[in] compr_mode The compression mode
+        @throws std::invalid_argument if the compression mode is not supported
+        @throws std::logic_error if the size does not fit in the return type
         */
-        void save(std::ostream &stream) const;
+        SEAL_NODISCARD inline std::streamoff save_size(
+            compr_mode_type compr_mode = Serialization::compr_mode_default) const
+        {
+            std::size_t coeff_modulus_total_size =
+                coeff_modulus_.empty()
+                    ? std::size_t(0)
+                    : util::safe_cast<std::size_t>(coeff_modulus_[0].save_size(compr_mode_type::none));
+            coeff_modulus_total_size = util::mul_safe(coeff_modulus_total_size, coeff_modulus_.size());
+
+            std::size_t members_size = Serialization::ComprSizeEstimate(
+                util::add_safe(
+                    sizeof(scheme_),
+                    sizeof(std::uint64_t), // poly_modulus_degree_
+                    sizeof(std::uint64_t), // coeff_modulus_size
+                    coeff_modulus_total_size,
+                    util::safe_cast<std::size_t>(plain_modulus_.save_size(compr_mode_type::none))),
+                compr_mode);
+
+            return util::safe_cast<std::streamoff>(util::add_safe(sizeof(Serialization::SEALHeader), members_size));
+        }
 
         /**
-        Loads the EncryptionParameters from an input stream overwriting the current 
+        Saves EncryptionParameters to an output stream. The output is in binary
+        format and is not human-readable. The output stream must have the "binary"
+        flag set.
+
+        @param[out] stream The stream to save the EncryptionParameters to
+        @param[in] compr_mode The desired compression mode
+        @throws std::invalid_argument if the compression mode is not supported
+        @throws std::logic_error if the data to be saved is invalid, or if
+        compression failed
+        @throws std::runtime_error if I/O operations failed
+        */
+        inline std::streamoff save(
+            std::ostream &stream, compr_mode_type compr_mode = Serialization::compr_mode_default) const
+        {
+            using namespace std::placeholders;
+            return Serialization::Save(
+                std::bind(&EncryptionParameters::save_members, this, _1), save_size(compr_mode_type::none), stream,
+                compr_mode);
+        }
+
+        /**
+        Loads EncryptionParameters from an input stream overwriting the current
         EncryptionParameters.
 
         @param[in] stream The stream to load the EncryptionParameters from
-        @see save() to save an EncryptionParameters instance.
+        @throws std::logic_error if the data cannot be loaded by this version of
+        Microsoft SEAL, if the loaded data is invalid, if decompression failed,
+        or if the loaded size exceeds in_size_bound
+        @throws std::runtime_error if I/O operations failed
         */
-        void load(std::istream &stream);
-
-        /**
-        Returns the hash block of the current parameters. This function is intended
-        mainly for internal use.
-        */
-        inline const hash_block_type &hash_block() const
+        inline std::streamoff load(std::istream &stream)
         {
-            return hash_block_;
+            using namespace std::placeholders;
+            EncryptionParameters new_parms(scheme_type::none);
+            auto in_size = Serialization::Load(std::bind(&EncryptionParameters::load_members, &new_parms, _1), stream);
+            std::swap(*this, new_parms);
+            return in_size;
         }
 
         /**
-        Enables access to private members of seal::EncryptionParameters for .NET wrapper.
+        Saves EncryptionParameters to a given memory location. The output is in
+        binary format and is not human-readable.
+
+        @param[out] out The memory location to write the EncryptionParameters to
+        @param[in] size The number of bytes available in the given memory location
+        @param[in] compr_mode The desired compression mode
+        @throws std::invalid_argument if out is null or if size is too small to
+        contain a SEALHeader, or if the compression mode is not supported
+        @throws std::logic_error if the data to be saved is invalid, or if
+        compression failed
+        @throws std::runtime_error if I/O operations failed
+        */
+        inline std::streamoff save(
+            SEAL_BYTE *out, std::size_t size, compr_mode_type compr_mode = Serialization::compr_mode_default) const
+        {
+            using namespace std::placeholders;
+            return Serialization::Save(
+                std::bind(&EncryptionParameters::save_members, this, _1), save_size(compr_mode_type::none), out, size,
+                compr_mode);
+        }
+
+        /**
+        Loads EncryptionParameters from a given memory location overwriting the
+        current EncryptionParameters.
+
+        @param[in] in The memory location to load the EncryptionParameters from
+        @param[in] size The number of bytes available in the given memory location
+        @throws std::invalid_argument if in is null or if size is too small to
+        contain a SEALHeader
+        @throws std::logic_error if the data cannot be loaded by this version of
+        Microsoft SEAL, if the loaded data is invalid, if decompression failed,
+        or if the loaded size exceeds in_size_bound
+        @throws std::runtime_error if I/O operations failed
+        */
+        inline std::streamoff load(const SEAL_BYTE *in, std::size_t size)
+        {
+            using namespace std::placeholders;
+            EncryptionParameters new_parms(scheme_type::none);
+            auto in_size =
+                Serialization::Load(std::bind(&EncryptionParameters::load_members, &new_parms, _1), in, size);
+            std::swap(*this, new_parms);
+            return in_size;
+        }
+
+        /**
+        Enables access to private members of seal::EncryptionParameters for SEAL_C.
         */
         struct EncryptionParametersPrivateHelper;
 
     private:
-        void compute_hash();
+        /**
+        Helper function to determine whether given std::uint8_t represents a valid
+        value for scheme_type. The return value will be false is the scheme is set
+        to scheme_type::none.
+        */
+        SEAL_NODISCARD bool is_valid_scheme(std::uint8_t scheme) const noexcept
+        {
+            switch (scheme)
+            {
+            case static_cast<std::uint8_t>(scheme_type::none):
+                /* fall through */
 
-        BigPoly poly_modulus_;
+            case static_cast<std::uint8_t>(scheme_type::BFV):
+                /* fall through */
 
-        SmallModulus plain_modulus_;
+            case static_cast<std::uint8_t>(scheme_type::CKKS):
+                return true;
+            }
+            return false;
+        }
 
-        std::vector<SmallModulus> coeff_modulus_;
+        /**
+        Returns the parms_id of the current parameters. This function is intended
+        for internal use.
+        */
+        SEAL_NODISCARD inline auto &parms_id() const noexcept
+        {
+            return parms_id_;
+        }
 
-        double noise_standard_deviation_ = util::global_variables::default_noise_standard_deviation;
+        void compute_parms_id();
 
-        double noise_max_deviation_ = util::global_variables::noise_distribution_width_multiplier 
-            * util::global_variables::default_noise_standard_deviation;
+        void save_members(std::ostream &stream) const;
 
-        UniformRandomGeneratorFactory *random_generator_ = nullptr;
+        void load_members(std::istream &stream);
 
-        hash_block_type hash_block_{ 0 };
+        MemoryPoolHandle pool_ = MemoryManager::GetPool();
 
-        friend class SEALContext;
+        scheme_type scheme_;
+
+        std::size_t poly_modulus_degree_ = 0;
+
+        std::vector<Modulus> coeff_modulus_{};
+
+        std::shared_ptr<UniformRandomGeneratorFactory> random_generator_{ nullptr };
+
+        Modulus plain_modulus_{};
+
+        parms_id_type parms_id_ = parms_id_zero;
     };
-}
+} // namespace seal
+
+/**
+Specializes the std::hash template for parms_id_type.
+*/
+namespace std
+{
+    template <>
+    struct hash<seal::parms_id_type>
+    {
+        std::size_t operator()(const seal::parms_id_type &parms_id) const
+        {
+            std::uint64_t result = 17;
+            result = 31 * result + parms_id[0];
+            result = 31 * result + parms_id[1];
+            result = 31 * result + parms_id[2];
+            result = 31 * result + parms_id[3];
+            return static_cast<std::size_t>(result);
+        }
+    };
+} // namespace std

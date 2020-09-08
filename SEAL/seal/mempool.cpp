@@ -1,9 +1,14 @@
-#include <cstring>
-#include <cmath>
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+
+#include "seal/util/common.h"
+#include "seal/util/mempool.h"
+#include "seal/util/uintarith.h"
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <numeric>
 #include <stdexcept>
-#include "mempool.h"
-#include "uintarith.h"
 
 using namespace std;
 
@@ -11,50 +16,89 @@ namespace seal
 {
     namespace util
     {
-        MemoryPoolHeadMT::MemoryPoolHeadMT(int64_t uint64_count) : 
-            locked_(false), uint64_count_(uint64_count), 
-            alloc_item_count_(mempool_first_alloc_count), 
-            first_item_(nullptr)
-        {
-            allocation new_alloc;
+        // Required for C++14 compliance: static constexpr member variables are not necessarily inlined so need to
+        // ensure symbol is created.
+        constexpr double MemoryPool::alloc_size_multiplier;
 
-            // Check if we are allocating too much
-            int64_t first_alloc_uint64_count = mempool_first_alloc_count * uint64_count_;
-            if (first_alloc_uint64_count > mempool_max_batch_alloc_uint64_count)
+        // Required for C++14 compliance: static constexpr member variables are not necessarily inlined so need to
+        // ensure symbol is created.
+        constexpr size_t MemoryPool::max_pool_head_count;
+
+        // Required for C++14 compliance: static constexpr member variables are not necessarily inlined so need to
+        // ensure symbol is created.
+        constexpr size_t MemoryPool::first_alloc_count;
+
+        MemoryPoolHeadMT::MemoryPoolHeadMT(size_t item_byte_count, bool clear_on_destruction)
+            : clear_on_destruction_(clear_on_destruction), locked_(false), item_byte_count_(item_byte_count),
+              item_count_(MemoryPool::first_alloc_count), first_item_(nullptr)
+        {
+            if ((item_byte_count_ == 0) || (item_byte_count_ > MemoryPool::max_batch_alloc_byte_count) ||
+                (mul_safe(item_byte_count_, MemoryPool::first_alloc_count) > MemoryPool::max_batch_alloc_byte_count))
             {
-                throw runtime_error("invalid allocation size");
+                throw invalid_argument("invalid allocation size");
             }
 
+            // Initial allocation
+            allocation new_alloc;
             try
             {
-                new_alloc.data_ptr = new uint64_t[first_alloc_uint64_count];
+                new_alloc.data_ptr = new SEAL_BYTE[mul_safe(MemoryPool::first_alloc_count, item_byte_count_)];
             }
-            catch (const bad_alloc &e)
+            catch (const bad_alloc &)
             {
-                // Allocation failed
-                throw e;
+                // Allocation failed; rethrow
+                throw;
             }
 
-            new_alloc.size = mempool_first_alloc_count;
-            new_alloc.free = mempool_first_alloc_count;
+            new_alloc.size = MemoryPool::first_alloc_count;
+            new_alloc.free = MemoryPool::first_alloc_count;
             new_alloc.head_ptr = new_alloc.data_ptr;
             allocs_.clear();
             allocs_.push_back(new_alloc);
         }
 
-        MemoryPoolHeadMT::~MemoryPoolHeadMT()
+        MemoryPoolHeadMT::~MemoryPoolHeadMT() noexcept
         {
             bool expected = false;
             while (!locked_.compare_exchange_strong(expected, true, memory_order_acquire))
             {
                 expected = false;
             }
-            for (size_t i = 0; i < allocs_.size(); i++)
+
+            // Delete the items (but not the memory)
+            MemoryPoolItem *curr_item = first_item_;
+            while (curr_item)
             {
-                delete[] allocs_[i].data_ptr;
+                MemoryPoolItem *next_item = curr_item->next();
+                delete curr_item;
+                curr_item = next_item;
             }
-            allocs_.clear();
             first_item_ = nullptr;
+
+            // Do we need to clear the memory?
+            if (clear_on_destruction_)
+            {
+                // Delete the memory
+                for (auto &alloc : allocs_)
+                {
+                    size_t curr_alloc_byte_count = mul_safe(item_byte_count_, alloc.size);
+                    seal_memzero(alloc.data_ptr, curr_alloc_byte_count);
+
+                    // Delete this allocation
+                    delete[] alloc.data_ptr;
+                }
+            }
+            else
+            {
+                // Delete the memory
+                for (auto &alloc : allocs_)
+                {
+                    // Delete this allocation
+                    delete[] alloc.data_ptr;
+                }
+            }
+
+            allocs_.clear();
         }
 
         MemoryPoolItem *MemoryPoolHeadMT::get()
@@ -76,7 +120,7 @@ namespace seal
                     // Pool is empty; there is memory
                     new_item = new MemoryPoolItem(last_alloc.head_ptr);
                     last_alloc.free--;
-                    last_alloc.head_ptr += uint64_count_;
+                    last_alloc.head_ptr += item_byte_count_;
                 }
                 else
                 {
@@ -84,30 +128,30 @@ namespace seal
                     allocation new_alloc;
 
                     // Increase allocation size unless we are already at max
-                    int64_t new_size = static_cast<int64_t>(
-                        ceil(mempool_alloc_size_multiplier * static_cast<double>(last_alloc.size)));
-                    int64_t new_uint64_count = new_size * uint64_count_;
-                    if (new_uint64_count > mempool_max_batch_alloc_uint64_count)
+                    size_t new_size = safe_cast<size_t>(
+                        ceil(MemoryPool::alloc_size_multiplier * static_cast<double>(last_alloc.size)));
+                    size_t new_alloc_byte_count = mul_safe(new_size, item_byte_count_);
+                    if (new_alloc_byte_count > MemoryPool::max_batch_alloc_byte_count)
                     {
                         new_size = last_alloc.size;
-                        new_uint64_count = new_size * uint64_count_;
+                        new_alloc_byte_count = new_size * item_byte_count_;
                     }
 
                     try
                     {
-                        new_alloc.data_ptr = new uint64_t[new_uint64_count];
+                        new_alloc.data_ptr = new SEAL_BYTE[new_alloc_byte_count];
                     }
-                    catch (const bad_alloc &e)
+                    catch (const bad_alloc &)
                     {
-                        // Allocation failed
-                        throw e;
+                        // Allocation failed; rethrow
+                        throw;
                     }
 
                     new_alloc.size = new_size;
                     new_alloc.free = new_size - 1;
-                    new_alloc.head_ptr = new_alloc.data_ptr + uint64_count_;
+                    new_alloc.head_ptr = new_alloc.data_ptr + item_byte_count_;
                     allocs_.push_back(new_alloc);
-                    alloc_item_count_ += new_size;
+                    item_count_ += new_size;
                     new_item = new MemoryPoolItem(new_alloc.data_ptr);
                 }
 
@@ -122,45 +166,71 @@ namespace seal
             return old_first;
         }
 
-        MemoryPoolHeadST::MemoryPoolHeadST(int64_t uint64_count) :
-            uint64_count_(uint64_count), 
-            alloc_item_count_(mempool_first_alloc_count), 
-            first_item_(nullptr)
+        MemoryPoolHeadST::MemoryPoolHeadST(size_t item_byte_count, bool clear_on_destruction)
+            : clear_on_destruction_(clear_on_destruction), item_byte_count_(item_byte_count),
+              item_count_(MemoryPool::first_alloc_count), first_item_(nullptr)
         {
-            allocation new_alloc;
-
-            // Check if we are allocating too much
-            int64_t first_alloc_uint64_count = mempool_first_alloc_count * uint64_count_;
-            if (first_alloc_uint64_count > mempool_max_batch_alloc_uint64_count)
+            if ((item_byte_count_ == 0) || (item_byte_count_ > MemoryPool::max_batch_alloc_byte_count) ||
+                (mul_safe(item_byte_count_, MemoryPool::first_alloc_count) > MemoryPool::max_batch_alloc_byte_count))
             {
-                throw runtime_error("invalid allocation size");
+                throw invalid_argument("invalid allocation size");
             }
 
+            // Initial allocation
+            allocation new_alloc;
             try
             {
-                new_alloc.data_ptr = new uint64_t[first_alloc_uint64_count];
+                new_alloc.data_ptr = new SEAL_BYTE[mul_safe(MemoryPool::first_alloc_count, item_byte_count_)];
             }
-            catch (const bad_alloc &e)
+            catch (const bad_alloc &)
             {
-                // Allocation failed
-                throw e;
+                // Allocation failed; rethrow
+                throw;
             }
 
-            new_alloc.size = mempool_first_alloc_count;
-            new_alloc.free = mempool_first_alloc_count;
+            new_alloc.size = MemoryPool::first_alloc_count;
+            new_alloc.free = MemoryPool::first_alloc_count;
             new_alloc.head_ptr = new_alloc.data_ptr;
             allocs_.clear();
             allocs_.push_back(new_alloc);
         }
 
-        MemoryPoolHeadST::~MemoryPoolHeadST()
+        MemoryPoolHeadST::~MemoryPoolHeadST() noexcept
         {
-            for (size_t i = 0; i < allocs_.size(); i++)
+            // Delete the items (but not the memory)
+            MemoryPoolItem *curr_item = first_item_;
+            while (curr_item)
             {
-                delete[] allocs_[i].data_ptr;
+                MemoryPoolItem *next_item = curr_item->next();
+                delete curr_item;
+                curr_item = next_item;
             }
-            allocs_.clear();
             first_item_ = nullptr;
+
+            // Do we need to clear the memory?
+            if (clear_on_destruction_)
+            {
+                // Delete the memory
+                for (auto &alloc : allocs_)
+                {
+                    size_t curr_alloc_byte_count = mul_safe(item_byte_count_, alloc.size);
+                    seal_memzero(alloc.data_ptr, curr_alloc_byte_count);
+
+                    // Delete this allocation
+                    delete[] alloc.data_ptr;
+                }
+            }
+            else
+            {
+                // Delete the memory
+                for (auto &alloc : allocs_)
+                {
+                    // Delete this allocation
+                    delete[] alloc.data_ptr;
+                }
+            }
+
+            allocs_.clear();
         }
 
         MemoryPoolItem *MemoryPoolHeadST::get()
@@ -177,7 +247,7 @@ namespace seal
                     // Pool is empty; there is memory
                     new_item = new MemoryPoolItem(last_alloc.head_ptr);
                     last_alloc.free--;
-                    last_alloc.head_ptr += uint64_count_;
+                    last_alloc.head_ptr += item_byte_count_;
                 }
                 else
                 {
@@ -185,28 +255,30 @@ namespace seal
                     allocation new_alloc;
 
                     // Increase allocation size unless we are already at max
-                    int64_t new_size = static_cast<int64_t>(
-                        ceil(mempool_alloc_size_multiplier * static_cast<double>(last_alloc.size)));
-                    if (new_size * uint64_count_ > mempool_max_batch_alloc_uint64_count)
+                    size_t new_size = safe_cast<size_t>(
+                        ceil(MemoryPool::alloc_size_multiplier * static_cast<double>(last_alloc.size)));
+                    size_t new_alloc_byte_count = mul_safe(new_size, item_byte_count_);
+                    if (new_alloc_byte_count > MemoryPool::max_batch_alloc_byte_count)
                     {
                         new_size = last_alloc.size;
+                        new_alloc_byte_count = new_size * item_byte_count_;
                     }
 
                     try
                     {
-                        new_alloc.data_ptr = new uint64_t[new_size * uint64_count_];
+                        new_alloc.data_ptr = new SEAL_BYTE[new_alloc_byte_count];
                     }
-                    catch (const bad_alloc &e)
+                    catch (const bad_alloc &)
                     {
-                        // Allocation failed
-                        throw e;
+                        // Allocation failed; rethrow
+                        throw;
                     }
 
                     new_alloc.size = new_size;
                     new_alloc.free = new_size - 1;
-                    new_alloc.head_ptr = new_alloc.data_ptr + uint64_count_;
+                    new_alloc.head_ptr = new_alloc.data_ptr + item_byte_count_;
                     allocs_.push_back(new_alloc);
-                    alloc_item_count_ += new_size;
+                    item_count_ += new_size;
                     new_item = new MemoryPoolItem(new_alloc.data_ptr);
                 }
 
@@ -219,25 +291,43 @@ namespace seal
             return old_first;
         }
 
-        MemoryPoolMT::~MemoryPoolMT()
+        const size_t MemoryPool::max_single_alloc_byte_count = []() -> size_t {
+            int bit_shift = static_cast<int>(ceil(log2(MemoryPool::alloc_size_multiplier)));
+            if (bit_shift < 0 || unsigned_geq(bit_shift, sizeof(size_t) * static_cast<size_t>(bits_per_byte)))
+            {
+                throw logic_error("alloc_size_multiplier too large");
+            }
+            return numeric_limits<size_t>::max() >> bit_shift;
+        }();
+
+        const size_t MemoryPool::max_batch_alloc_byte_count = []() -> size_t {
+            int bit_shift = static_cast<int>(ceil(log2(MemoryPool::alloc_size_multiplier)));
+            if (bit_shift < 0 || unsigned_geq(bit_shift, sizeof(size_t) * static_cast<size_t>(bits_per_byte)))
+            {
+                throw logic_error("alloc_size_multiplier too large");
+            }
+            return numeric_limits<size_t>::max() >> bit_shift;
+        }();
+
+        MemoryPoolMT::~MemoryPoolMT() noexcept
         {
             WriterLock lock(pools_locker_.acquire_write());
-            for (size_t i = 0; i < pools_.size(); i++)
+            for (MemoryPoolHead *head : pools_)
             {
-                delete pools_[i];
+                delete head;
             }
             pools_.clear();
         }
 
-        Pointer MemoryPoolMT::get_for_uint64_count(int64_t uint64_count)
+        Pointer<SEAL_BYTE> MemoryPoolMT::get_for_byte_count(size_t byte_count)
         {
-            if (uint64_count < 0 || uint64_count > mempool_max_single_alloc_uint64_count)
+            if (byte_count > max_single_alloc_byte_count)
             {
                 throw invalid_argument("invalid allocation size");
             }
-            else if (uint64_count == 0)
+            else if (byte_count == 0)
             {
-                return Pointer();
+                return Pointer<SEAL_BYTE>();
             }
 
             // Attempt to find size.
@@ -248,18 +338,18 @@ namespace seal
             {
                 size_t mid = (start + end) / 2;
                 MemoryPoolHead *mid_head = pools_[mid];
-                int64_t mid_uint64_count = mid_head->uint64_count();
-                if (uint64_count < mid_uint64_count)
+                size_t mid_byte_count = mid_head->item_byte_count();
+                if (byte_count < mid_byte_count)
                 {
                     start = mid + 1;
                 }
-                else if (uint64_count > mid_uint64_count)
+                else if (byte_count > mid_byte_count)
                 {
                     end = mid;
                 }
                 else
                 {
-                    return Pointer(mid_head);
+                    return Pointer<SEAL_BYTE>(mid_head);
                 }
             }
             reader_lock.unlock();
@@ -272,72 +362,68 @@ namespace seal
             {
                 size_t mid = (start + end) / 2;
                 MemoryPoolHead *mid_head = pools_[mid];
-                int64_t mid_uint64_count = mid_head->uint64_count();
-                if (uint64_count < mid_uint64_count)
+                size_t mid_byte_count = mid_head->item_byte_count();
+                if (byte_count < mid_byte_count)
                 {
                     start = mid + 1;
                 }
-                else if (uint64_count > mid_uint64_count)
+                else if (byte_count > mid_byte_count)
                 {
                     end = mid;
                 }
                 else
                 {
-                    return Pointer(mid_head);
+                    return Pointer<SEAL_BYTE>(mid_head);
                 }
             }
 
             // Size was still not found, but we own an exclusive lock so just add it,
             // but first check if we are at maximum pool head count already.
-            if (pools_.size() >= static_cast<size_t>(mempool_max_pool_head_count))
+            if (pools_.size() >= max_pool_head_count)
             {
                 throw runtime_error("maximum pool head count reached");
             }
 
-            MemoryPoolHead *new_head = new MemoryPoolHeadMT(uint64_count);
+            MemoryPoolHead *new_head = new MemoryPoolHeadMT(byte_count, clear_on_destruction_);
             if (!pools_.empty())
             {
-                pools_.insert(pools_.begin() + start, new_head);
+                pools_.insert(pools_.begin() + static_cast<ptrdiff_t>(start), new_head);
             }
             else
             {
                 pools_.emplace_back(new_head);
             }
 
-            return Pointer(new_head);
+            return Pointer<SEAL_BYTE>(new_head);
         }
 
-        int64_t MemoryPoolMT::alloc_uint64_count() const
+        size_t MemoryPoolMT::alloc_byte_count() const
         {
             ReaderLock lock(pools_locker_.acquire_read());
-            int64_t uint64_count = 0;
 
-            for (size_t i = 0; i < pools_.size(); i++)
-            {
-                MemoryPoolHead *head = pools_[i];
-                uint64_count += head->alloc_item_count() * head->uint64_count();
-            }
-            return uint64_count;
+            return accumulate(pools_.cbegin(), pools_.cend(), size_t(0), [](size_t byte_count, MemoryPoolHead *head) {
+                return add_safe(byte_count, mul_safe(head->item_count(), head->item_byte_count()));
+            });
         }
 
-        MemoryPoolST::~MemoryPoolST()
+        MemoryPoolST::~MemoryPoolST() noexcept
         {
-            for (size_t i = 0; i < pools_.size(); i++)
+            for (MemoryPoolHead *head : pools_)
             {
-                delete pools_[i];
+                delete head;
             }
             pools_.clear();
         }
 
-        Pointer MemoryPoolST::get_for_uint64_count(int64_t uint64_count)
+        Pointer<SEAL_BYTE> MemoryPoolST::get_for_byte_count(size_t byte_count)
         {
-            if (uint64_count < 0 || uint64_count > mempool_max_single_alloc_uint64_count)
+            if (byte_count > MemoryPool::max_single_alloc_byte_count)
             {
                 throw invalid_argument("invalid allocation size");
             }
-            else if (uint64_count == 0)
+            else if (byte_count == 0)
             {
-                return Pointer();
+                return Pointer<SEAL_BYTE>();
             }
 
             // Attempt to find size.
@@ -347,50 +433,46 @@ namespace seal
             {
                 size_t mid = (start + end) / 2;
                 MemoryPoolHead *mid_head = pools_[mid];
-                int64_t mid_uint64_count = mid_head->uint64_count();
-                if (uint64_count < mid_uint64_count)
+                size_t mid_byte_count = mid_head->item_byte_count();
+                if (byte_count < mid_byte_count)
                 {
                     start = mid + 1;
                 }
-                else if (uint64_count > mid_uint64_count)
+                else if (byte_count > mid_byte_count)
                 {
                     end = mid;
                 }
                 else
                 {
-                    return Pointer(mid_head);
+                    return Pointer<SEAL_BYTE>(mid_head);
                 }
             }
 
-            // Size was not found so just add it, but first check if we are at 
+            // Size was not found so just add it, but first check if we are at
             // maximum pool head count already.
-            if (pools_.size() >= static_cast<size_t>(mempool_max_pool_head_count))
+            if (pools_.size() >= max_pool_head_count)
             {
                 throw runtime_error("maximum pool head count reached");
             }
 
-            MemoryPoolHead *new_head = new MemoryPoolHeadST(uint64_count);
+            MemoryPoolHead *new_head = new MemoryPoolHeadST(byte_count, clear_on_destruction_);
             if (!pools_.empty())
             {
-                pools_.insert(pools_.begin() + start, new_head);
+                pools_.insert(pools_.begin() + static_cast<ptrdiff_t>(start), new_head);
             }
             else
             {
                 pools_.emplace_back(new_head);
             }
 
-            return Pointer(new_head);
+            return Pointer<SEAL_BYTE>(new_head);
         }
 
-        int64_t MemoryPoolST::alloc_uint64_count() const
+        size_t MemoryPoolST::alloc_byte_count() const
         {
-            int64_t uint64_count = 0;
-            for (size_t i = 0; i < pools_.size(); i++)
-            {
-                MemoryPoolHead *head = pools_[i];
-                uint64_count += head->alloc_item_count() * head->uint64_count();
-            }
-            return uint64_count;
+            return accumulate(pools_.cbegin(), pools_.cend(), size_t(0), [](size_t byte_count, MemoryPoolHead *head) {
+                return add_safe(byte_count, mul_safe(head->item_count(), head->item_byte_count()));
+            });
         }
-    }
-}
+    } // namespace util
+} // namespace seal
